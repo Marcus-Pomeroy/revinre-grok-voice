@@ -3,6 +3,7 @@ const twilio = require('twilio');
 
 const app = express();
 app.use(express.json());
+
 app.get('/', (req, res) => {
   res.send('Revinre Grok voice app is running');
 });
