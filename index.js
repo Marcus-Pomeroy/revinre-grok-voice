@@ -13,7 +13,7 @@ app.post('/voice', (req, res) => {
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Dial answerOnBridge="true">
-    <Sip>sip:${process.env.TWILIO_NUMBER.replace('+','+')}@sip.voice.x.ai;transport=tls</Sip>
+    <Sip>${process.env.XAI_SIP_URI}</Sip>
   </Dial>
 </Response>`);
 });
