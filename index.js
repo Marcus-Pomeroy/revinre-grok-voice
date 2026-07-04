@@ -136,15 +136,30 @@ function deriveOutcome(twilioStatus, operators) {
   // Call was answered — check operators in priority order
   const matched = (name) => operators.find(op => op.name === name && op.matched);
 
+  // Voicemail wins if detected (either built-in classification or custom phrase-match)
   if (matched("Voicemail Detection") || matched("Voicemail Left")) {
     return "left_voicemail";
   }
+
+  // Specific transfer direction takes priority over generic transfer detection
   if (matched("Transferred to Hunt Mortgage")) {
     return "Transferred_To_HUNT_Mortgage";
   }
   if (matched("Transferred to REVINRE")) {
     return "Transferred_To_REVINRE";
   }
+
+  // Generic transfer safety net — a transfer happened but we couldn't identify direction
+  if (matched("Transfer Initiated")) {
+    return "Transferred_Unknown";
+  }
+
+  // Not interested is a valid negative outcome
+  if (matched("Not Interested")) {
+    return "follow_up_needed";
+  }
+
+  // Default: answered but no operator matched
   return "follow_up_needed";
 }
 
