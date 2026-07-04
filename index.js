@@ -58,8 +58,8 @@ app.post('/call', async (req, res) => {
   }
 });
 
-// Helper: fetch Voice Intelligence transcript for a recording SID
-async function fetchVoiceIntelligenceTranscript(recordingSid) {
+// Helper: fetch Voice Intelligence transcript + operator results for a recording SID
+async function fetchVoiceIntelligenceData(recordingSid) {
   try {
     const transcripts = await client.intelligence.v2.transcripts.list({
       sourceSid: recordingSid,
@@ -67,13 +67,13 @@ async function fetchVoiceIntelligenceTranscript(recordingSid) {
     });
 
     if (transcripts.length === 0) {
-      return { status: "not_found", text: null, sentences: [] };
+      return { status: "not_found", text: null, sentences: [], operators: [] };
     }
 
     const transcript = transcripts[0];
 
     if (transcript.status !== "completed") {
-      return { status: transcript.status, text: null, sentences: [] };
+      return { status: transcript.status, text: null, sentences: [], operators: [] };
     }
 
     // Fetch sentences
@@ -90,16 +90,62 @@ async function fetchVoiceIntelligenceTranscript(recordingSid) {
 
     const fullText = formatted.map(s => `${s.speaker}: ${s.text}`).join('\n');
 
+    // Fetch operator results
+    let operators = [];
+    try {
+      const operatorResults = await client.intelligence.v2
+        .transcripts(transcript.sid)
+        .operatorResults
+        .list({ limit: 50 });
+
+      operators = operatorResults.map(op => ({
+        name: op.name,
+        operator_type: op.operatorType,
+        matched: op.matchProbability > 0.5 || (op.extractResults && Object.keys(op.extractResults).length > 0) || (op.matchedUtterances && op.matchedUtterances.length > 0),
+        match_probability: op.matchProbability,
+        matched_utterances: op.matchedUtterances || [],
+        predicted_label: op.predictedLabel,
+        predicted_probability: op.predictedProbability
+      }));
+    } catch (opErr) {
+      console.log("Operator results fetch error:", opErr.message);
+    }
+
     return {
       status: "completed",
       transcript_sid: transcript.sid,
       text: fullText,
-      sentences: formatted
+      sentences: formatted,
+      operators
     };
   } catch (error) {
     console.log("Transcript fetch error:", error.message);
-    return { status: "error", text: null, sentences: [], error: error.message };
+    return { status: "error", text: null, sentences: [], operators: [], error: error.message };
   }
+}
+
+// Helper: derive smart outcome from operators + call status
+function deriveOutcome(twilioStatus, operators) {
+  // If call didn't complete normally, use Twilio's status
+  if (twilioStatus === "no-answer") return "no_answer";
+  if (twilioStatus === "busy") return "busy";
+  if (twilioStatus === "failed") return "failed";
+  if (twilioStatus === "canceled") return "canceled";
+  if (twilioStatus === "in-progress") return "in_progress";
+
+  // Call was answered — check operators in priority order
+  const matched = (name) => operators.find(op => op.name === name && op.matched);
+
+  if (matched("Voicemail Detection") || matched("Voicemail Left")) {
+    return "left_voicemail";
+  }
+  if (matched("Transferred to Hunt Mortgage")) {
+    return "Transferred_To_HUNT_Mortgage";
+  }
+  if (matched("Transferred to REVINRE")) {
+    return "Transferred_To_REVINRE";
+  }
+  return "follow_up_needed";
 }
 
 // Get full call data (Zapier hits this to update Lofty)
@@ -131,24 +177,19 @@ app.get('/call/:callSid', async (req, res) => {
       console.log("No recording available yet:", e.message);
     }
 
-    // Voice Intelligence transcript (auto-created since Auto Transcribe is ON)
     let transcript_status = "no_recording";
     let transcript_text = null;
     let transcript_sentences = [];
+    let operators = [];
     if (recording_sid) {
-      const vi = await fetchVoiceIntelligenceTranscript(recording_sid);
+      const vi = await fetchVoiceIntelligenceData(recording_sid);
       transcript_status = vi.status;
       transcript_text = vi.text;
       transcript_sentences = vi.sentences;
+      operators = vi.operators;
     }
 
-    let outcome = "unknown";
-    if (twilioCall.status === "completed") outcome = "answered";
-    else if (twilioCall.status === "no-answer") outcome = "no_answer";
-    else if (twilioCall.status === "busy") outcome = "busy";
-    else if (twilioCall.status === "failed") outcome = "failed";
-    else if (twilioCall.status === "canceled") outcome = "canceled";
-    else if (twilioCall.status === "in-progress") outcome = "in_progress";
+    const outcome = deriveOutcome(twilioCall.status, operators);
 
     const responseData = {
       call_sid: callSid,
@@ -170,6 +211,7 @@ app.get('/call/:callSid', async (req, res) => {
       transcript_status,
       transcript_text,
       transcript_sentences,
+      operators,
       created_at: leadInfo.created_at,
       fetched_at: new Date().toISOString()
     };
