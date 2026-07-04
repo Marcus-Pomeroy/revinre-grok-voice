@@ -1,6 +1,5 @@
 const express = require('express');
 const twilio = require('twilio');
-const axios = require('axios');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -59,6 +58,50 @@ app.post('/call', async (req, res) => {
   }
 });
 
+// Helper: fetch Voice Intelligence transcript for a recording SID
+async function fetchVoiceIntelligenceTranscript(recordingSid) {
+  try {
+    const transcripts = await client.intelligence.v2.transcripts.list({
+      sourceSid: recordingSid,
+      limit: 1
+    });
+
+    if (transcripts.length === 0) {
+      return { status: "not_found", text: null, sentences: [] };
+    }
+
+    const transcript = transcripts[0];
+
+    if (transcript.status !== "completed") {
+      return { status: transcript.status, text: null, sentences: [] };
+    }
+
+    // Fetch sentences
+    const sentences = await client.intelligence.v2
+      .transcripts(transcript.sid)
+      .sentences
+      .list({ limit: 500 });
+
+    const formatted = sentences.map(s => ({
+      speaker: s.mediaChannel !== undefined ? `speaker_${s.mediaChannel}` : "speaker",
+      text: s.transcript || s.text || "",
+      confidence: s.confidence
+    }));
+
+    const fullText = formatted.map(s => `${s.speaker}: ${s.text}`).join('\n');
+
+    return {
+      status: "completed",
+      transcript_sid: transcript.sid,
+      text: fullText,
+      sentences: formatted
+    };
+  } catch (error) {
+    console.log("Transcript fetch error:", error.message);
+    return { status: "error", text: null, sentences: [], error: error.message };
+  }
+}
+
 // Get full call data (Zapier hits this to update Lofty)
 app.get('/call/:callSid', async (req, res) => {
   try {
@@ -75,10 +118,12 @@ app.get('/call/:callSid', async (req, res) => {
     const twilioCall = await client.calls(callSid).fetch();
 
     let recording_url = null;
+    let recording_sid = null;
     let recording_duration = null;
     try {
       const recordings = await client.recordings.list({ callSid, limit: 1 });
       if (recordings.length > 0) {
+        recording_sid = recordings[0].sid;
         recording_url = `https://api.twilio.com${recordings[0].uri.replace('.json', '.mp3')}`;
         recording_duration = recordings[0].duration;
       }
@@ -86,14 +131,15 @@ app.get('/call/:callSid', async (req, res) => {
       console.log("No recording available yet:", e.message);
     }
 
-    let xai_transcript = null;
-    try {
-      const xaiRes = await axios.get(`https://api.x.ai/v1/voice/calls/${callSid}`, {
-        headers: { Authorization: `Bearer ${process.env.XAI_API_KEY}` }
-      });
-      xai_transcript = xaiRes.data;
-    } catch (e) {
-      xai_transcript = "No xAI transcript available yet";
+    // Voice Intelligence transcript (auto-created since Auto Transcribe is ON)
+    let transcript_status = "no_recording";
+    let transcript_text = null;
+    let transcript_sentences = [];
+    if (recording_sid) {
+      const vi = await fetchVoiceIntelligenceTranscript(recording_sid);
+      transcript_status = vi.status;
+      transcript_text = vi.text;
+      transcript_sentences = vi.sentences;
     }
 
     let outcome = "unknown";
@@ -118,9 +164,12 @@ app.get('/call/:callSid', async (req, res) => {
       price: twilioCall.price,
       start_time: twilioCall.startTime,
       end_time: twilioCall.endTime,
+      recording_sid,
       recording_url,
       recording_duration,
-      xai_transcript,
+      transcript_status,
+      transcript_text,
+      transcript_sentences,
       created_at: leadInfo.created_at,
       fetched_at: new Date().toISOString()
     };
