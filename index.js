@@ -25,7 +25,7 @@ app.post('/voice', (req, res) => {
 // Start outbound call from Zapier (pass lead info)
 app.post('/call', async (req, res) => {
   try {
-    const { to, lofty_lead_id, lead_name, lead_email } = req.body;
+    const { to, lofty_lead_id, lead_name, lead_email, property_address } = req.body;
 
     const call = await client.calls.create({
       url: `${process.env.PUBLIC_URL}/voice`,
@@ -41,10 +41,11 @@ app.post('/call', async (req, res) => {
       lofty_lead_id: lofty_lead_id || "unknown",
       lead_name: lead_name || "unknown",
       lead_email: lead_email || "unknown",
+      property_address: property_address || "unknown",
       created_at: new Date().toISOString()
     };
 
-    console.log(`Call started: ${call.sid} for lead ${lofty_lead_id}`);
+    console.log(`Call started: ${call.sid} for lead ${lofty_lead_id} (${lead_name}) property: ${property_address}`);
 
     res.json({
       success: true,
@@ -67,6 +68,7 @@ app.get('/call/:callSid', async (req, res) => {
       lofty_lead_id: req.query.lofty_lead_id || "unknown",
       lead_name: "unknown",
       lead_email: "unknown",
+      property_address: "unknown",
       created_at: null
     };
 
@@ -107,6 +109,7 @@ app.get('/call/:callSid', async (req, res) => {
       lofty_lead_id: leadInfo.lofty_lead_id,
       lead_name: leadInfo.lead_name,
       lead_email: leadInfo.lead_email,
+      property_address: leadInfo.property_address,
       status: twilioCall.status,
       outcome,
       duration: twilioCall.duration,
