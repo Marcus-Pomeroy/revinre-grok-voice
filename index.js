@@ -15,11 +15,11 @@ const callLeadMap = {};
 // lofty_user_id must match the userId Lofty API expects for lead assignment.
 const AGENT_ROSTER = {
   revinre: [
-    { name: "Marcus Pomeroy", phone: "+16235567626", lofty_user_id: 844762677574243 }
+    { name: "Marcus Pomeroy", phone: "+16235567626", lofty_user_id: 844762677574243, lofty_email: "marcus.pomeroy@revinre.com" }
     // Add more Revinre agents here as we roll out wider
   ],
   hunt: [
-    { name: "Marcus Pomeroy", phone: "+16235567626", lofty_user_id: 844762677574243 }
+    { name: "Marcus Pomeroy", phone: "+16235567626", lofty_user_id: 844762677574243, lofty_email: "marcus.pomeroy@revinre.com" }
     // Add Hunt Mortgage agents here as we roll out wider
   ]
 };
@@ -244,7 +244,7 @@ app.post('/dial-completed/:destination', async (req, res) => {
 
     // Kick off Lofty reassignment + SMS in parallel
     await Promise.allSettled([
-      assignLeadInLofty(leadInfo.lofty_lead_id, agent.lofty_user_id, agent.name),
+      assignLeadInLofty(leadInfo.lofty_lead_id, agent.lofty_user_id, agent.name, agent.lofty_email),
       sendAgentSms(agent, leadInfo)
     ]);
   } catch (err) {
@@ -252,8 +252,11 @@ app.post('/dial-completed/:destination', async (req, res) => {
   }
 });
 
-// Assign the Lofty lead to the specific agent that answered the transfer
-async function assignLeadInLofty(loftyLeadId, loftyUserId, agentName) {
+// Assign the Lofty lead to the specific agent that answered the transfer.
+// Lofty API is inconsistent between OpenAPI schema (array root, role+assignee)
+// and their guide (object root with `assignees`). We try the array form first
+// per the OpenAPI schema, then fall back to the guide form if that 400s.
+async function assignLeadInLofty(loftyLeadId, loftyUserId, agentName, agentEmail) {
   if (!loftyLeadId || loftyLeadId === 'unknown') {
     console.warn(`assignLeadInLofty: missing loftyLeadId — skipping`);
     return;
@@ -264,27 +267,50 @@ async function assignLeadInLofty(loftyLeadId, loftyUserId, agentName) {
   }
 
   const url = `${process.env.LOFTY_API_BASE || 'https://api.lofty.com'}/v1.0/leads/${loftyLeadId}/assignment`;
-  const body = { assignees: [{ userId: loftyUserId }] };
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `token ${process.env.LOFTY_API_KEY}`
+  };
 
-  try {
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `token ${process.env.LOFTY_API_KEY}`
-      },
-      body: JSON.stringify(body)
-    });
+  // Prefer email if provided (matches OpenAPI example); otherwise stringify user ID
+  const assigneeValue = agentEmail || String(loftyUserId);
 
-    const text = await resp.text();
-    if (resp.ok) {
-      console.log(`Lofty assignment success: lead ${loftyLeadId} -> ${agentName} (${loftyUserId})`);
-    } else {
-      console.error(`Lofty assignment failed: HTTP ${resp.status} body=${text}`);
+  // Attempt 1: OpenAPI schema — array root with role + assignee
+  const bodyA = [{ role: 'Agent', assignee: assigneeValue }];
+  // Attempt 2: Guide format — object with `assignees` array and numeric userId
+  const bodyB = { assignees: [{ userId: loftyUserId }] };
+  // Attempt 3: Same as B but userId as string (JS number precision safety)
+  const bodyC = { assignees: [{ userId: String(loftyUserId) }] };
+
+  const attempts = [
+    { label: 'array/role+assignee', body: bodyA },
+    { label: 'assignees/userId(number)', body: bodyB },
+    { label: 'assignees/userId(string)', body: bodyC }
+  ];
+
+  for (const attempt of attempts) {
+    try {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(attempt.body)
+      });
+      const text = await resp.text();
+      if (resp.ok) {
+        console.log(`Lofty assignment success [${attempt.label}]: lead ${loftyLeadId} -> ${agentName} (${loftyUserId})`);
+        return;
+      }
+      console.warn(`Lofty assignment attempt [${attempt.label}] failed: HTTP ${resp.status} body=${text}`);
+      // Only retry on 400 — other errors (401/403/404) won't be fixed by a different body shape
+      if (resp.status !== 400) {
+        console.error(`Lofty assignment giving up on non-400 status ${resp.status}`);
+        return;
+      }
+    } catch (err) {
+      console.error(`Lofty assignment error [${attempt.label}]: ${err.message}`);
     }
-  } catch (err) {
-    console.error(`Lofty assignment error: ${err.message}`);
   }
+  console.error(`Lofty assignment: all ${attempts.length} body-shape attempts failed for lead ${loftyLeadId}`);
 }
 
 // Send SMS to the answering agent with lead context
