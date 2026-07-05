@@ -134,7 +134,8 @@ app.post('/transfer', async (req, res) => {
 });
 
 // TwiML endpoint that Twilio hits after Call Update.
-// Returns <Dial> to the human number. answerOnBridge keeps recording continuous.
+// Returns <Dial> to the human number with a whisper played to the answering agent.
+// answerOnBridge=true keeps the lead hearing ringing (no dead air) while whisper plays to the agent.
 app.post('/twiml/dial/:destination', (req, res) => {
   const destination = (req.params.destination || '').toLowerCase().trim();
   const targetNumber = TRANSFER_DESTINATIONS[destination];
@@ -151,11 +152,50 @@ app.post('/twiml/dial/:destination', (req, res) => {
     return;
   }
 
+  // Whisper URL includes destination + call context for dynamic message
+  const whisperUrl = `${process.env.PUBLIC_URL}/twiml/whisper/${destination}`;
+
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Dial answerOnBridge="true" callerId="${process.env.TWILIO_NUMBER}">
-    <Number>${targetNumber}</Number>
+    <Number url="${whisperUrl}">${targetNumber}</Number>
   </Dial>
+</Response>`);
+});
+
+// Whisper TwiML — played ONLY to the answering agent before the bridge.
+// Lead continues to hear ringing (thanks to answerOnBridge=true on the parent Dial).
+app.post('/twiml/whisper/:destination', (req, res) => {
+  const destination = (req.params.destination || '').toLowerCase().trim();
+
+  // Find the most recently transferred call for context
+  const recentTransfer = Object.entries(callLeadMap)
+    .filter(([_, info]) => info.transfer_destination === destination && info.transfer_initiated_at)
+    .sort((a, b) => new Date(b[1].transfer_initiated_at) - new Date(a[1].transfer_initiated_at))[0];
+
+  let whisperText;
+  const teamName = destination === 'hunt' ? 'Hunt Mortgage' : 'Revinree';
+
+  if (recentTransfer) {
+    const info = recentTransfer[1];
+    const leadName = info.lead_name && info.lead_name !== 'unknown' ? info.lead_name : null;
+    const propertyAddress = info.property_address && info.property_address !== 'unknown' ? info.property_address : null;
+
+    const parts = [`Incoming ${teamName} lead from Realtor.com.`];
+    if (leadName) parts.push(`Lead name: ${leadName}.`);
+    if (propertyAddress) parts.push(`Property: ${propertyAddress}.`);
+    parts.push(`Full details in Lofty.`);
+    whisperText = parts.join(' ');
+  } else {
+    whisperText = `Incoming ${teamName} lead from Realtor.com. Full details in Lofty.`;
+  }
+
+  console.log(`Whisper playing for ${destination}: ${whisperText}`);
+
+  res.type('text/xml');
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">${whisperText}</Say>
 </Response>`);
 });
 
