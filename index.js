@@ -10,6 +10,12 @@ const client = twilio(process.env.TWILIO_SID, process.env.TWILIO_TOKEN);
 // In-memory notepad: call_sid -> lead info
 const callLeadMap = {};
 
+// Destination map: what Sara says -> real phone number
+const TRANSFER_DESTINATIONS = {
+  revinre: process.env.REVINRE_TRANSFER_NUMBER || '+18882688021',
+  hunt:    process.env.HUNT_TRANSFER_NUMBER    || '+16027309912'
+};
+
 // Bridge to Grok Voice
 app.post('/voice', (req, res) => {
   res.type('text/xml');
@@ -41,7 +47,9 @@ app.post('/call', async (req, res) => {
       lead_name: lead_name || "unknown",
       lead_email: lead_email || "unknown",
       property_address: property_address || "unknown",
-      created_at: new Date().toISOString()
+      lead_phone: to,
+      created_at: new Date().toISOString(),
+      status: "initiated"
     };
 
     console.log(`Call started: ${call.sid} for lead ${lofty_lead_id} (${lead_name}) property: ${property_address}`);
@@ -58,7 +66,103 @@ app.post('/call', async (req, res) => {
   }
 });
 
-// Helper: fetch Voice Intelligence transcript + operator results for a recording SID
+// ============================================================
+// TRANSFER FLOW (Twilio-driven, replaces Grok's native transfer)
+// ============================================================
+
+// Grok Voice's transfer_call tool hits this endpoint.
+// Body: { destination: "revinre" | "hunt" }
+// We find the active call, then Twilio Call Update swaps in new TwiML.
+app.post('/transfer', async (req, res) => {
+  try {
+    const destination = (req.body.destination || '').toLowerCase().trim();
+
+    // Validate destination
+    if (!TRANSFER_DESTINATIONS[destination]) {
+      console.error(`Transfer failed: unknown destination "${destination}"`);
+      return res.status(400).json({
+        success: false,
+        error: `Unknown destination "${destination}". Must be one of: ${Object.keys(TRANSFER_DESTINATIONS).join(', ')}`
+      });
+    }
+
+    // Find the currently-active call from our in-memory map.
+    // We look for the most recently-created call still in progress.
+    const activeCalls = Object.entries(callLeadMap)
+      .filter(([_, info]) => info.status === "in-progress" || info.status === "initiated" || info.status === "ringing")
+      .sort((a, b) => new Date(b[1].created_at) - new Date(a[1].created_at));
+
+    if (activeCalls.length === 0) {
+      console.error("Transfer failed: no active call found in callLeadMap");
+      return res.status(404).json({
+        success: false,
+        error: "No active call found to transfer"
+      });
+    }
+
+    const [callSid, leadInfo] = activeCalls[0];
+    const targetNumber = TRANSFER_DESTINATIONS[destination];
+
+    console.log(`Transfer requested: call ${callSid} -> ${destination} (${targetNumber})`);
+
+    // Update the live Twilio call with new TwiML that dials the human
+    const twimlUrl = `${process.env.PUBLIC_URL}/twiml/dial/${destination}`;
+
+    await client.calls(callSid).update({
+      url: twimlUrl,
+      method: 'POST'
+    });
+
+    console.log(`Transfer executed: ${callSid} -> ${targetNumber} via ${twimlUrl}`);
+
+    // Mark the transfer intent on the lead record for later Voice Intelligence correlation
+    callLeadMap[callSid].transfer_destination = destination;
+    callLeadMap[callSid].transfer_target = targetNumber;
+    callLeadMap[callSid].transfer_initiated_at = new Date().toISOString();
+
+    return res.json({
+      success: true,
+      call_sid: callSid,
+      destination,
+      target_number: targetNumber,
+      message: `Transferring to ${destination}`
+    });
+  } catch (error) {
+    console.error("Transfer error:", error.message);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// TwiML endpoint that Twilio hits after Call Update.
+// Returns <Dial> to the human number. answerOnBridge keeps recording continuous.
+app.post('/twiml/dial/:destination', (req, res) => {
+  const destination = (req.params.destination || '').toLowerCase().trim();
+  const targetNumber = TRANSFER_DESTINATIONS[destination];
+
+  res.type('text/xml');
+
+  if (!targetNumber) {
+    // Unknown destination — say a fallback and hang up
+    res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">I'm sorry, we couldn't complete the transfer. You can reach our team directly at six oh two, five six two, seven two two two. Have a great day.</Say>
+  <Hangup/>
+</Response>`);
+    return;
+  }
+
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial answerOnBridge="true" callerId="${process.env.TWILIO_NUMBER}">
+    <Number>${targetNumber}</Number>
+  </Dial>
+</Response>`);
+});
+
+// ============================================================
+// VOICE INTELLIGENCE / LOFTY UPDATE PIPELINE (unchanged)
+// ============================================================
+
 async function fetchVoiceIntelligenceData(recordingSid) {
   try {
     const transcripts = await client.intelligence.v2.transcripts.list({
@@ -76,7 +180,6 @@ async function fetchVoiceIntelligenceData(recordingSid) {
       return { status: transcript.status, text: null, sentences: [], operators: [] };
     }
 
-    // Fetch sentences
     const sentences = await client.intelligence.v2
       .transcripts(transcript.sid)
       .sentences
@@ -90,7 +193,6 @@ async function fetchVoiceIntelligenceData(recordingSid) {
 
     const fullText = formatted.map(s => `${s.speaker}: ${s.text}`).join('\n');
 
-    // Fetch operator results
     let operators = [];
     try {
       const operatorResults = await client.intelligence.v2
@@ -124,46 +226,33 @@ async function fetchVoiceIntelligenceData(recordingSid) {
   }
 }
 
-// Helper: derive smart outcome from operators + call status
-function deriveOutcome(twilioStatus, operators) {
-  // If call didn't complete normally, use Twilio's status
+function deriveOutcome(twilioStatus, operators, leadInfo) {
   if (twilioStatus === "no-answer") return "no_answer";
   if (twilioStatus === "busy") return "busy";
   if (twilioStatus === "failed") return "failed";
   if (twilioStatus === "canceled") return "canceled";
   if (twilioStatus === "in-progress") return "in_progress";
 
-  // Call was answered — check operators in priority order
   const matched = (name) => operators.find(op => op.name === name && op.matched);
 
-  // Voicemail wins if detected (either built-in classification or custom phrase-match)
   if (matched("Voicemail Detection") || matched("Voicemail Left")) {
     return "left_voicemail";
   }
 
-  // Specific transfer direction takes priority over generic transfer detection
-  if (matched("Transferred to Hunt Mortgage")) {
-    return "Transferred_To_HUNT_Mortgage";
-  }
-  if (matched("Transferred to REVINRE")) {
-    return "Transferred_To_REVINRE";
+  // If Railway actually executed a transfer, trust that outcome over operator matches
+  if (leadInfo && leadInfo.transfer_destination) {
+    if (leadInfo.transfer_destination === "hunt") return "Transferred_To_HUNT_Mortgage";
+    if (leadInfo.transfer_destination === "revinre") return "Transferred_To_REVINRE";
   }
 
-  // Generic transfer safety net — a transfer happened but we couldn't identify direction
-  if (matched("Transfer Initiated")) {
-    return "Transferred_Unknown";
-  }
+  if (matched("Transferred to Hunt Mortgage")) return "Transferred_To_HUNT_Mortgage";
+  if (matched("Transferred to REVINRE")) return "Transferred_To_REVINRE";
+  if (matched("Transfer Initiated")) return "Transferred_Unknown";
+  if (matched("Not Interested")) return "follow_up_needed";
 
-  // Not interested is a valid negative outcome
-  if (matched("Not Interested")) {
-    return "follow_up_needed";
-  }
-
-  // Default: answered but no operator matched
   return "follow_up_needed";
 }
 
-// Get full call data (Zapier hits this to update Lofty)
 app.get('/call/:callSid', async (req, res) => {
   try {
     const callSid = req.params.callSid;
@@ -204,7 +293,7 @@ app.get('/call/:callSid', async (req, res) => {
       operators = vi.operators;
     }
 
-    const outcome = deriveOutcome(twilioCall.status, operators);
+    const outcome = deriveOutcome(twilioCall.status, operators, leadInfo);
 
     const responseData = {
       call_sid: callSid,
@@ -227,6 +316,9 @@ app.get('/call/:callSid', async (req, res) => {
       transcript_text,
       transcript_sentences,
       operators,
+      transfer_destination: leadInfo.transfer_destination || null,
+      transfer_target: leadInfo.transfer_target || null,
+      transfer_initiated_at: leadInfo.transfer_initiated_at || null,
       created_at: leadInfo.created_at,
       fetched_at: new Date().toISOString()
     };
@@ -238,7 +330,6 @@ app.get('/call/:callSid', async (req, res) => {
   }
 });
 
-// Debug: list all calls in memory
 app.get('/calls', (req, res) => {
   const calls = Object.entries(callLeadMap).map(([sid, info]) => ({
     call_sid: sid,
@@ -247,13 +338,16 @@ app.get('/calls', (req, res) => {
   res.json({ count: calls.length, calls });
 });
 
-// Status callback from Twilio
+// Status callback from Twilio — keeps callLeadMap.status current so /transfer can find active calls
 app.post('/status', (req, res) => {
-  console.log("Call status update:", req.body.CallSid, req.body.CallStatus);
+  const { CallSid, CallStatus } = req.body;
+  console.log("Call status update:", CallSid, CallStatus);
+  if (callLeadMap[CallSid]) {
+    callLeadMap[CallSid].status = CallStatus;
+  }
   res.sendStatus(200);
 });
 
-// Health check
 app.get('/', (req, res) => {
   res.json({ status: "ok", uptime: process.uptime() });
 });
