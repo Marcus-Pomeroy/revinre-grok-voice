@@ -145,8 +145,8 @@ app.post('/transfer', async (req, res) => {
       success: true,
       call_sid: callSid,
       destination,
-      target_number: targetNumber,
-      message: `Transferring to ${destination}`
+      agent_count: agentCount,
+      message: `Transferring to ${destination} (fanning out to ${agentCount} agent(s))`
     });
   } catch (error) {
     console.error("Transfer error:", error.message);
@@ -181,8 +181,12 @@ app.post('/twiml/dial/:destination', (req, res) => {
     .map(a => `    <Number url="${whisperUrl}">${a.phone}</Number>`)
     .join('\n');
 
+  // Short hold message so the lead doesn't hear dead air while we dial the agent.
+  // Twilio's <Dial> after an already-answered call produces silence until bridge —
+  // this <Say> covers that gap. Kept short so it doesn't hold up the transfer.
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+  <Say voice="alice">One moment, connecting you now.</Say>
   <Dial answerOnBridge="true" callerId="${process.env.TWILIO_NUMBER}" timeout="${DIAL_TIMEOUT_SECONDS}" action="${actionUrl}" method="POST">
 ${numberElements}
   </Dial>
