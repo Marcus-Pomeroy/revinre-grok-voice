@@ -10,11 +10,33 @@ const client = twilio(process.env.TWILIO_SID, process.env.TWILIO_TOKEN);
 // In-memory notepad: call_sid -> lead info
 const callLeadMap = {};
 
-// Destination map: what Sara says -> real phone number
-const TRANSFER_DESTINATIONS = {
-  revinre: process.env.REVINRE_TRANSFER_NUMBER || '+18882688021',
-  hunt:    process.env.HUNT_TRANSFER_NUMBER    || '+16027309912'
+// Agent roster: which agents to fan out to per destination.
+// Adding/removing agents = edit this map. Numbers must be E.164 format.
+// lofty_user_id must match the userId Lofty API expects for lead assignment.
+const AGENT_ROSTER = {
+  revinre: [
+    { name: "Marcus Pomeroy", phone: "+16235567626", lofty_user_id: 844762677574243 }
+    // Add more Revinre agents here as we roll out wider
+  ],
+  hunt: [
+    { name: "Marcus Pomeroy", phone: "+16235567626", lofty_user_id: 844762677574243 }
+    // Add Hunt Mortgage agents here as we roll out wider
+  ]
 };
+
+// Ring timeout for the fanout (seconds). If nobody picks up, Sara's fallback plays.
+const DIAL_TIMEOUT_SECONDS = 25;
+
+// Lookup helper: find agent info from the phone number that Twilio reports as answered
+function findAgentByPhone(phone) {
+  if (!phone) return null;
+  const normalized = phone.replace(/[^0-9+]/g, '');
+  for (const dest of Object.keys(AGENT_ROSTER)) {
+    const match = AGENT_ROSTER[dest].find(a => a.phone.replace(/[^0-9+]/g, '') === normalized);
+    if (match) return { ...match, destination: dest };
+  }
+  return null;
+}
 
 // Bridge to Grok Voice
 app.post('/voice', (req, res) => {
@@ -134,16 +156,16 @@ app.post('/transfer', async (req, res) => {
 });
 
 // TwiML endpoint that Twilio hits after Call Update.
-// Returns <Dial> to the human number with a whisper played to the answering agent.
-// answerOnBridge=true keeps the lead hearing ringing (no dead air) while whisper plays to the agent.
+// Dials each agent in the roster in parallel, with whisper attached to each Number.
+// Whoever picks up first hears the whisper on their leg; lead hears ringing (no dead air).
 app.post('/twiml/dial/:destination', (req, res) => {
   const destination = (req.params.destination || '').toLowerCase().trim();
-  const targetNumber = TRANSFER_DESTINATIONS[destination];
+  const agents = AGENT_ROSTER[destination];
 
   res.type('text/xml');
 
-  if (!targetNumber) {
-    // Unknown destination — say a fallback and hang up
+  if (!agents || agents.length === 0) {
+    console.error(`No agents configured for destination "${destination}"`);
     res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="alice">I'm sorry, we couldn't complete the transfer. You can reach our team directly at six oh two, five six two, seven two two two. Have a great day.</Say>
@@ -152,16 +174,140 @@ app.post('/twiml/dial/:destination', (req, res) => {
     return;
   }
 
-  // Whisper URL includes destination + call context for dynamic message
   const whisperUrl = `${process.env.PUBLIC_URL}/twiml/whisper/${destination}`;
+  const actionUrl = `${process.env.PUBLIC_URL}/dial-completed/${destination}`;
+
+  // Build one <Number> element per agent with whisper attached
+  const numberElements = agents
+    .map(a => `    <Number url="${whisperUrl}">${a.phone}</Number>`)
+    .join('\n');
 
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Dial answerOnBridge="true" callerId="${process.env.TWILIO_NUMBER}">
-    <Number url="${whisperUrl}">${targetNumber}</Number>
+  <Dial answerOnBridge="true" callerId="${process.env.TWILIO_NUMBER}" timeout="${DIAL_TIMEOUT_SECONDS}" action="${actionUrl}" method="POST">
+${numberElements}
   </Dial>
 </Response>`);
 });
+
+// Called by Twilio when the <Dial> ends (successful bridge, no-answer, busy, etc.).
+// If completed, identify which agent answered and (a) update Lofty (b) SMS the agent.
+app.post('/dial-completed/:destination', async (req, res) => {
+  const destination = (req.params.destination || '').toLowerCase().trim();
+  const { DialCallStatus, DialCallSid, DialCallDuration, CallSid: parentCallSid } = req.body;
+
+  console.log(`Dial completed: destination=${destination} status=${DialCallStatus} childSid=${DialCallSid} parentSid=${parentCallSid} duration=${DialCallDuration}`);
+
+  // Always respond immediately — continue whatever's left in the parent TwiML flow.
+  // Empty <Response> just lets the parent call end naturally.
+  res.type('text/xml');
+  res.send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
+
+  // Only process successful bridges
+  if (DialCallStatus !== 'completed' && DialCallStatus !== 'answered') {
+    console.log(`Dial ended without connection (${DialCallStatus}) — skipping Lofty/SMS updates`);
+    return;
+  }
+
+  if (!DialCallSid) {
+    console.log(`No DialCallSid — cannot identify answering agent`);
+    return;
+  }
+
+  // Post-response async work: identify agent, update Lofty, send SMS
+  try {
+    const childCall = await client.calls(DialCallSid).fetch();
+    const answeredNumber = childCall.to;
+    console.log(`Answering leg to: ${answeredNumber}`);
+
+    const agent = findAgentByPhone(answeredNumber);
+    if (!agent) {
+      console.warn(`No agent match for answered number ${answeredNumber}`);
+      return;
+    }
+
+    // Find lead info from callLeadMap using the parent call SID
+    const leadInfo = callLeadMap[parentCallSid] || {};
+
+    // Record who answered
+    if (callLeadMap[parentCallSid]) {
+      callLeadMap[parentCallSid].answered_by_agent = {
+        name: agent.name,
+        phone: agent.phone,
+        lofty_user_id: agent.lofty_user_id,
+        answered_at: new Date().toISOString()
+      };
+    }
+
+    // Kick off Lofty reassignment + SMS in parallel
+    await Promise.allSettled([
+      assignLeadInLofty(leadInfo.lofty_lead_id, agent.lofty_user_id, agent.name),
+      sendAgentSms(agent, leadInfo)
+    ]);
+  } catch (err) {
+    console.error(`dial-completed post-processing error: ${err.message}`);
+  }
+});
+
+// Assign the Lofty lead to the specific agent that answered the transfer
+async function assignLeadInLofty(loftyLeadId, loftyUserId, agentName) {
+  if (!loftyLeadId || loftyLeadId === 'unknown') {
+    console.warn(`assignLeadInLofty: missing loftyLeadId — skipping`);
+    return;
+  }
+  if (!process.env.LOFTY_API_KEY) {
+    console.warn(`assignLeadInLofty: LOFTY_API_KEY not set — skipping`);
+    return;
+  }
+
+  const url = `${process.env.LOFTY_API_BASE || 'https://api.lofty.com'}/v1.0/leads/${loftyLeadId}/assignment`;
+  const body = { assignees: [{ userId: loftyUserId }] };
+
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `token ${process.env.LOFTY_API_KEY}`
+      },
+      body: JSON.stringify(body)
+    });
+
+    const text = await resp.text();
+    if (resp.ok) {
+      console.log(`Lofty assignment success: lead ${loftyLeadId} -> ${agentName} (${loftyUserId})`);
+    } else {
+      console.error(`Lofty assignment failed: HTTP ${resp.status} body=${text}`);
+    }
+  } catch (err) {
+    console.error(`Lofty assignment error: ${err.message}`);
+  }
+}
+
+// Send SMS to the answering agent with lead context
+async function sendAgentSms(agent, leadInfo) {
+  if (!agent.phone) return;
+
+  const lines = [`🏠 Revinree AI-qualified lead just transferred to you.`];
+  if (leadInfo.lead_name && leadInfo.lead_name !== 'unknown') lines.push(`Name: ${leadInfo.lead_name}`);
+  if (leadInfo.lead_phone) lines.push(`Phone: ${leadInfo.lead_phone}`);
+  if (leadInfo.lead_email && leadInfo.lead_email !== 'unknown') lines.push(`Email: ${leadInfo.lead_email}`);
+  if (leadInfo.property_address && leadInfo.property_address !== 'unknown') lines.push(`Property: ${leadInfo.property_address}`);
+  lines.push(`Full transcript + qualification will be in Lofty shortly.`);
+
+  const messageBody = lines.join('\n');
+
+  try {
+    const msg = await client.messages.create({
+      to: agent.phone,
+      from: process.env.TWILIO_NUMBER,
+      body: messageBody
+    });
+    console.log(`Agent SMS sent to ${agent.name} (${agent.phone}): ${msg.sid}`);
+  } catch (err) {
+    console.error(`Agent SMS error: ${err.message}`);
+  }
+}
 
 // Whisper TwiML — played ONLY to the answering agent before the bridge.
 // Lead continues to hear ringing (thanks to answerOnBridge=true on the parent Dial).
