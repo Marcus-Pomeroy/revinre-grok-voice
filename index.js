@@ -99,12 +99,12 @@ app.post('/transfer', async (req, res) => {
   try {
     const destination = (req.body.destination || '').toLowerCase().trim();
 
-    // Validate destination
-    if (!TRANSFER_DESTINATIONS[destination]) {
-      console.error(`Transfer failed: unknown destination "${destination}"`);
+    // Validate destination against the agent roster
+    if (!AGENT_ROSTER[destination] || AGENT_ROSTER[destination].length === 0) {
+      console.error(`Transfer failed: unknown or empty destination "${destination}"`);
       return res.status(400).json({
         success: false,
-        error: `Unknown destination "${destination}". Must be one of: ${Object.keys(TRANSFER_DESTINATIONS).join(', ')}`
+        error: `Unknown destination "${destination}". Must be one of: ${Object.keys(AGENT_ROSTER).join(', ')}`
       });
     }
 
@@ -123,11 +123,11 @@ app.post('/transfer', async (req, res) => {
     }
 
     const [callSid, leadInfo] = activeCalls[0];
-    const targetNumber = TRANSFER_DESTINATIONS[destination];
+    const agentCount = AGENT_ROSTER[destination].length;
 
-    console.log(`Transfer requested: call ${callSid} -> ${destination} (${targetNumber})`);
+    console.log(`Transfer requested: call ${callSid} -> ${destination} (fanning out to ${agentCount} agent(s))`);
 
-    // Update the live Twilio call with new TwiML that dials the human
+    // Update the live Twilio call with new TwiML that fans out to agents
     const twimlUrl = `${process.env.PUBLIC_URL}/twiml/dial/${destination}`;
 
     await client.calls(callSid).update({
@@ -135,11 +135,10 @@ app.post('/transfer', async (req, res) => {
       method: 'POST'
     });
 
-    console.log(`Transfer executed: ${callSid} -> ${targetNumber} via ${twimlUrl}`);
+    console.log(`Transfer executed: ${callSid} -> ${destination} fanout via ${twimlUrl}`);
 
     // Mark the transfer intent on the lead record for later Voice Intelligence correlation
     callLeadMap[callSid].transfer_destination = destination;
-    callLeadMap[callSid].transfer_target = targetNumber;
     callLeadMap[callSid].transfer_initiated_at = new Date().toISOString();
 
     return res.json({
