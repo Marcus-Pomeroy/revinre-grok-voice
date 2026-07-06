@@ -129,6 +129,60 @@ app.post('/call', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+// ============================================================
+// SARA TOOL: get_lead_info
+// ============================================================
+// Sara calls this mid-conversation (after the greeting + rapport reply) to
+// personalize the next line with the property address. Lead data is already
+// in callLeadMap from /call (pre-fetch happens at call-start time), so this
+// is an instant in-memory lookup — no external API round-trip.
+//
+// Contract with Sara:
+//   POST /tool/get-lead-info  (no body required)
+//   returns: { success, first_name, property_address, has_address }
+//
+// Selection strategy: find the most-recent active call in callLeadMap.
+// This mirrors the same "most-recent-active" pattern /transfer uses.
+app.post('/tool/get-lead-info', (req, res) => {
+  try {
+    const activeCalls = Object.entries(callLeadMap)
+      .filter(([_, info]) => info.status === 'in-progress' || info.status === 'initiated' || info.status === 'ringing')
+      .sort((a, b) => new Date(b[1].created_at) - new Date(a[1].created_at));
+
+    if (activeCalls.length === 0) {
+      console.warn('[/tool/get-lead-info] no active call found — returning safe fallback');
+      return res.json({
+        success: true,
+        first_name: 'there',
+        property_address: null,
+        has_address: false,
+        message: 'No active call context. Use the generic fallback line.'
+      });
+    }
+
+    const [callSid, info] = activeCalls[0];
+    const firstName = (info.lead_name && info.lead_name !== 'unknown') ? info.lead_name : 'there';
+    const propertyAddress = (info.property_address && info.property_address !== 'unknown') ? info.property_address : null;
+
+    console.log(`[/tool/get-lead-info] callSid=${callSid} first_name="${firstName}" property_address="${propertyAddress || 'none'}"`);
+
+    return res.json({
+      success: true,
+      first_name: firstName,
+      property_address: propertyAddress,
+      has_address: !!propertyAddress
+    });
+  } catch (err) {
+    console.error('[/tool/get-lead-info] error:', err.message);
+    return res.json({
+      success: true,
+      first_name: 'there',
+      property_address: null,
+      has_address: false,
+      error: err.message
+    });
+  }
+});
 
 // ============================================================
 // TRANSFER FLOW — Conference-based with hold music + simultaneous fanout
