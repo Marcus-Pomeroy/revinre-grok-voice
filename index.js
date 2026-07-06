@@ -59,20 +59,33 @@ app.post('/voice', (req, res) => {
 });
 
 // Normalize helpers
+// Treat these values as "no data" — they show up when Zapier pills are empty,
+// Lofty fields are blank, or upstream systems substitute placeholder text.
+const JUNK_VALUES = new Set([
+  '', 'unknown', 'none', 'null', 'undefined', 'n/a', 'na', 'not provided',
+  'not specified', 'not available', 'no address', 'no name', '-', '--'
+]);
+
+function isJunk(val) {
+  if (val === null || val === undefined) return true;
+  if (typeof val !== 'string') return false;
+  return JUNK_VALUES.has(val.trim().toLowerCase());
+}
+
 function firstNameOnly(fullName) {
-  if (!fullName || typeof fullName !== 'string') return "unknown";
-  const cleaned = fullName.trim();
-  if (!cleaned || cleaned.toLowerCase() === 'unknown') return "unknown";
+  if (isJunk(fullName)) return "unknown";
+  const cleaned = String(fullName).trim();
   const first = cleaned.split(/\s+/)[0].replace(/[^\p{L}\p{M}'\-]/gu, '');
-  return first || "unknown";
+  if (!first || isJunk(first)) return "unknown";
+  return first;
 }
 
 function streetOnly(addr) {
-  if (!addr || typeof addr !== 'string') return "unknown";
-  const cleaned = addr.trim();
-  if (!cleaned || cleaned.toLowerCase() === 'unknown') return "unknown";
+  if (isJunk(addr)) return "unknown";
+  const cleaned = String(addr).trim();
   const street = cleaned.split(',')[0].trim();
-  return street || "unknown";
+  if (!street || isJunk(street)) return "unknown";
+  return street;
 }
 
 // XML escape for safe injection into TwiML
@@ -129,6 +142,7 @@ app.post('/call', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
 // ============================================================
 // SARA TOOL: get_lead_info
 // ============================================================
@@ -161,8 +175,8 @@ app.post('/tool/get-lead-info', (req, res) => {
     }
 
     const [callSid, info] = activeCalls[0];
-    const firstName = (info.lead_name && info.lead_name !== 'unknown') ? info.lead_name : 'there';
-    const propertyAddress = (info.property_address && info.property_address !== 'unknown') ? info.property_address : null;
+    const firstName = !isJunk(info.lead_name) ? info.lead_name : 'there';
+    const propertyAddress = !isJunk(info.property_address) ? info.property_address : null;
 
     console.log(`[/tool/get-lead-info] callSid=${callSid} first_name="${firstName}" property_address="${propertyAddress || 'none'}"`);
 
