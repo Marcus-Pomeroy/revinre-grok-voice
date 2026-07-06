@@ -192,6 +192,7 @@ app.post('/transfer', async (req, res) => {
       qualification,
       agentCallSids: [],
       answeredAgent: null,
+      timeoutHandle: null,
       createdAt: new Date().toISOString()
     };
 
@@ -228,11 +229,14 @@ app.post('/transfer', async (req, res) => {
 
     await Promise.allSettled(agentDialPromises);
 
-    // Step 3: Start the fallback timer — if no agent joins in DIAL_TIMEOUT_SECONDS + 5, play "call you back"
-    setTimeout(async () => {
+    // Step 3: Start the fallback timer — if no agent joins in DIAL_TIMEOUT_SECONDS + buffer, play "call you back"
+    // Buffer accounts for Twilio call.create() initiate delay (~1-3s) + human pickup swipe (~1-2s).
+    // Timer is stored on the conference so /conference-events can cancel it when an agent joins.
+    const FALLBACK_BUFFER_SECONDS = 10;
+    conferenceMap[conferenceName].timeoutHandle = setTimeout(async () => {
       const conf = conferenceMap[conferenceName];
       if (conf && !conf.answeredAgent) {
-        console.log(`Timeout: no agent joined conference ${conferenceName} — playing fallback to lead`);
+        console.log(`Timeout: no agent joined conference ${conferenceName} in ${DIAL_TIMEOUT_SECONDS + FALLBACK_BUFFER_SECONDS}s — playing fallback to lead`);
         try {
           await client.calls(callSid).update({
             url: `${process.env.PUBLIC_URL}/twiml/no-agent-available`,
@@ -253,8 +257,10 @@ app.post('/transfer', async (req, res) => {
             // ignore
           }
         }
+      } else if (conf && conf.answeredAgent) {
+        console.log(`Timeout fired but agent ${conf.answeredAgent.name} already joined — no action needed`);
       }
-    }, (DIAL_TIMEOUT_SECONDS + 5) * 1000);
+    }, (DIAL_TIMEOUT_SECONDS + FALLBACK_BUFFER_SECONDS) * 1000);
 
     return res.json({
       success: true,
@@ -433,6 +439,13 @@ app.post('/conference-events/:conferenceName', async (req, res) => {
     if (agentEntry && !conf.answeredAgent) {
       conf.answeredAgent = { sid: CallSid, phone: agentEntry.phone, name: agentEntry.name, joined_at: new Date().toISOString() };
       console.log(`FIRST AGENT JOINED: ${agentEntry.name} (${agentEntry.phone}) — canceling other agent legs`);
+
+      // Cancel the fallback timer — agent made it in time
+      if (conf.timeoutHandle) {
+        clearTimeout(conf.timeoutHandle);
+        conf.timeoutHandle = null;
+        console.log(`Fallback timer canceled for ${conferenceName}`);
+      }
 
       // Cancel all other agent legs
       const otherLegs = conf.agentCallSids.filter(a => a.sid !== CallSid);
