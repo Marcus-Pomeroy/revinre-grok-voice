@@ -263,13 +263,16 @@ app.post('/transfer', async (req, res) => {
 
     await Promise.allSettled(agentDialPromises);
 
+    // Return a terminal instruction that Sara's model will treat as "do not speak or emit further tool calls".
+    // Grok/xAI models generally obey tool-response instructions more strictly than system-prompt rules.
     return res.json({
       success: true,
       call_sid: callSid,
       destination,
       conference: conferenceName,
       agent_count: agents.length,
-      message: `Lead moved to conference. Dialing ${agents.length} agent(s) simultaneously.`
+      message: "TRANSFER_COMPLETE_END_SESSION",
+      instructions_to_agent: "The transfer is complete. The caller has been moved to hold music and cannot hear you. DO NOT speak, DO NOT emit any further tool calls (including end_call), DO NOT narrate. Your session is over. Return no further output."
     });
   } catch (error) {
     console.error("Transfer error:", error.message);
@@ -700,13 +703,31 @@ app.get('/call/:callSid', async (req, res) => {
   try {
     const callSid = req.params.callSid;
 
-    const leadInfo = callLeadMap[callSid] || {
-      lofty_lead_id: req.query.lofty_lead_id || "unknown",
-      lead_name: "unknown",
-      lead_email: "unknown",
-      property_address: "unknown",
-      created_at: null
+    // Zapier passes lead info as query params on every /call/:sid fetch as a safety net,
+    // in case Railway's in-memory callLeadMap was wiped by a container restart.
+    // Any "unknown" field in the map is backfilled from the query params below.
+    const q = req.query || {};
+    const mapEntry = callLeadMap[callSid] || {};
+    const pickField = (mapVal, qVal) => {
+      if (mapVal && mapVal !== "unknown") return mapVal;
+      if (qVal && String(qVal).trim() !== "") return String(qVal);
+      return mapVal || "unknown";
     };
+
+    const leadInfo = {
+      ...mapEntry,
+      lofty_lead_id: pickField(mapEntry.lofty_lead_id, q.lofty_lead_id),
+      lead_name: pickField(mapEntry.lead_name, q.lead_name),
+      lead_name_full: pickField(mapEntry.lead_name_full, q.lead_name_full || q.lead_name),
+      lead_email: pickField(mapEntry.lead_email, q.lead_email),
+      property_address: pickField(mapEntry.property_address, q.property_address),
+      created_at: mapEntry.created_at || null
+    };
+
+    const usedFallback = !callLeadMap[callSid];
+    if (usedFallback) {
+      console.log(`[/call/${callSid}] callLeadMap MISS — using query-param fallback. lofty_lead_id=${leadInfo.lofty_lead_id} lead_name=${leadInfo.lead_name}`);
+    }
 
     const twilioCall = await client.calls(callSid).fetch();
 
