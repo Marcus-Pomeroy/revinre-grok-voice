@@ -38,21 +38,70 @@ function findAgentByPhone(phone) {
   return null;
 }
 
-// Bridge to Grok Voice
+// Bridge to Grok Voice.
+// Injects per-call lead context (name, property, phone) into the SIP URI
+// as query parameters. xAI's Grok Voice reads these and exposes them as
+// {{lead_name}}, {{property_address}}, {{lead_phone}} inside Sara's system prompt.
 app.post('/voice', (req, res) => {
+  const callSid = req.body.CallSid;
+  const lead = (callSid && callLeadMap[callSid]) || {};
+
+  // Build SIP URI with lead context as query params.
+  // xAI endpoint format: sip:agent_XXX@voice.x.ai
+  const params = new URLSearchParams();
+  if (lead.lead_name && lead.lead_name !== 'unknown') params.set('lead_name', lead.lead_name);
+  if (lead.property_address && lead.property_address !== 'unknown') params.set('property_address', lead.property_address);
+  if (lead.lead_phone) params.set('lead_phone', lead.lead_phone);
+  if (lead.lead_email && lead.lead_email !== 'unknown') params.set('lead_email', lead.lead_email);
+
+  const baseSip = process.env.XAI_SIP_URI || '';
+  const qs = params.toString();
+  // Merge params: if baseSip already has a `?`, append with `&`; otherwise use `?`
+  const separator = baseSip.includes('?') ? '&' : '?';
+  const sipUri = qs ? `${baseSip}${separator}${qs}` : baseSip;
+
+  console.log(`[/voice] CallSid=${callSid} lead=${lead.lead_name || 'unknown'} property=${lead.property_address || 'unknown'}`);
+
   res.type('text/xml');
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Dial answerOnBridge="true" record="record-from-answer">
-    <Sip>${process.env.XAI_SIP_URI}</Sip>
+    <Sip>${sipUri}</Sip>
   </Dial>
 </Response>`);
 });
+
+// Normalize lead_name → first name only.
+// Zapier may pass "Marcus Pomeroy" or "Marcus P." — Sara should only speak "Marcus".
+function firstNameOnly(fullName) {
+  if (!fullName || typeof fullName !== 'string') return "unknown";
+  const cleaned = fullName.trim();
+  if (!cleaned || cleaned.toLowerCase() === 'unknown') return "unknown";
+  // Split on whitespace, take first token. Strip trailing punctuation.
+  const first = cleaned.split(/\s+/)[0].replace(/[^\p{L}\p{M}'\-]/gu, '');
+  return first || "unknown";
+}
+
+// Normalize property_address → street only.
+// Realtor.com/Lofty typically sends "9145 W Buckskin Trl, Peoria, AZ 85383".
+// Sara should only speak the street portion ("9145 W Buckskin Trl").
+// Strategy: split on comma, take the first segment. If there's no comma,
+// return the whole string (already street-only).
+function streetOnly(addr) {
+  if (!addr || typeof addr !== 'string') return "unknown";
+  const cleaned = addr.trim();
+  if (!cleaned || cleaned.toLowerCase() === 'unknown') return "unknown";
+  const street = cleaned.split(',')[0].trim();
+  return street || "unknown";
+}
 
 // Start outbound call from Zapier (pass lead info)
 app.post('/call', async (req, res) => {
   try {
     const { to, lofty_lead_id, lead_name, lead_email, property_address } = req.body;
+
+    const normalizedName = firstNameOnly(lead_name);
+    const normalizedAddress = streetOnly(property_address);
 
     const call = await client.calls.create({
       url: `${process.env.PUBLIC_URL}/voice`,
@@ -66,15 +115,17 @@ app.post('/call', async (req, res) => {
 
     callLeadMap[call.sid] = {
       lofty_lead_id: lofty_lead_id || "unknown",
-      lead_name: lead_name || "unknown",
+      lead_name: normalizedName,
+      lead_name_full: lead_name || "unknown",   // preserve original for SMS/whisper
       lead_email: lead_email || "unknown",
-      property_address: property_address || "unknown",
+      property_address: normalizedAddress,
+      property_address_full: property_address || "unknown", // preserve original for SMS/whisper
       lead_phone: to,
       created_at: new Date().toISOString(),
       status: "initiated"
     };
 
-    console.log(`Call started: ${call.sid} for lead ${lofty_lead_id} (${lead_name}) property: ${property_address}`);
+    console.log(`Call started: ${call.sid} for lead ${lofty_lead_id} (raw="${lead_name}" → sara="${normalizedName}") property: raw="${property_address}" → sara="${normalizedAddress}"`);
 
     res.json({
       success: true,
@@ -317,11 +368,19 @@ async function assignLeadInLofty(loftyLeadId, loftyUserId, agentName, agentEmail
 async function sendAgentSms(agent, leadInfo) {
   if (!agent.phone) return;
 
+  // SMS to human agent — use FULL name and FULL address (city/state/zip)
+  const smsName = (leadInfo.lead_name_full && leadInfo.lead_name_full !== 'unknown')
+    ? leadInfo.lead_name_full
+    : leadInfo.lead_name;
+  const smsAddress = (leadInfo.property_address_full && leadInfo.property_address_full !== 'unknown')
+    ? leadInfo.property_address_full
+    : leadInfo.property_address;
+
   const lines = [`🏠 Revinree AI-qualified lead just transferred to you.`];
-  if (leadInfo.lead_name && leadInfo.lead_name !== 'unknown') lines.push(`Name: ${leadInfo.lead_name}`);
+  if (smsName && smsName !== 'unknown') lines.push(`Name: ${smsName}`);
   if (leadInfo.lead_phone) lines.push(`Phone: ${leadInfo.lead_phone}`);
   if (leadInfo.lead_email && leadInfo.lead_email !== 'unknown') lines.push(`Email: ${leadInfo.lead_email}`);
-  if (leadInfo.property_address && leadInfo.property_address !== 'unknown') lines.push(`Property: ${leadInfo.property_address}`);
+  if (smsAddress && smsAddress !== 'unknown') lines.push(`Property: ${smsAddress}`);
   lines.push(`Full transcript + qualification will be in Lofty shortly.`);
 
   const messageBody = lines.join('\n');
@@ -353,8 +412,13 @@ app.post('/twiml/whisper/:destination', (req, res) => {
 
   if (recentTransfer) {
     const info = recentTransfer[1];
-    const leadName = info.lead_name && info.lead_name !== 'unknown' ? info.lead_name : null;
-    const propertyAddress = info.property_address && info.property_address !== 'unknown' ? info.property_address : null;
+    // Whisper to human agent — use FULL name and FULL address for context
+    const leadName = (info.lead_name_full && info.lead_name_full !== 'unknown')
+      ? info.lead_name_full
+      : (info.lead_name && info.lead_name !== 'unknown' ? info.lead_name : null);
+    const propertyAddress = (info.property_address_full && info.property_address_full !== 'unknown')
+      ? info.property_address_full
+      : (info.property_address && info.property_address !== 'unknown' ? info.property_address : null);
 
     const parts = [`Incoming ${teamName} lead from Realtor.com.`];
     if (leadName) parts.push(`Lead name: ${leadName}.`);
