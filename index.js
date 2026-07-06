@@ -38,29 +38,24 @@ function findAgentByPhone(phone) {
   return null;
 }
 
-// Bridge to Grok Voice.
-// Injects per-call lead context (name, property, phone) into the SIP URI
-// as query parameters. xAI's Grok Voice reads these and exposes them as
-// {{lead_name}}, {{property_address}}, {{lead_phone}} inside Sara's system prompt.
+// Bridge to Grok Voice via xAI's SIP endpoint.
+// NOTE ON LEAD VARIABLES:
+// xAI's SIP endpoint does NOT read query params or SIP headers for variables.
+// Grok Voice variables are injected via the WebSocket 'session.update'
+// event's 'instructions' field at call time — which requires xAI's
+// webhook → WebSocket flow (POST /v2/phone-numbers with byo_trunk),
+// NOT a Twilio <Dial><Sip> bridge.
+// For now we route Twilio → xAI SIP cleanly; personalization is handled
+// inside Sara's script via her tone/questions rather than dynamic variables.
 app.post('/voice', (req, res) => {
   const callSid = req.body.CallSid;
   const lead = (callSid && callLeadMap[callSid]) || {};
 
-  // Build SIP URI with lead context as query params.
-  // xAI endpoint format: sip:agent_XXX@voice.x.ai
-  const params = new URLSearchParams();
-  if (lead.lead_name && lead.lead_name !== 'unknown') params.set('lead_name', lead.lead_name);
-  if (lead.property_address && lead.property_address !== 'unknown') params.set('property_address', lead.property_address);
-  if (lead.lead_phone) params.set('lead_phone', lead.lead_phone);
-  if (lead.lead_email && lead.lead_email !== 'unknown') params.set('lead_email', lead.lead_email);
+  // Use base SIP URI as-is. Do NOT append query params — xAI's SIP
+  // trunk rejects unknown headers and Twilio plays "application error."
+  const sipUri = process.env.XAI_SIP_URI || '';
 
-  const baseSip = process.env.XAI_SIP_URI || '';
-  const qs = params.toString();
-  // Merge params: if baseSip already has a `?`, append with `&`; otherwise use `?`
-  const separator = baseSip.includes('?') ? '&' : '?';
-  const sipUri = qs ? `${baseSip}${separator}${qs}` : baseSip;
-
-  console.log(`[/voice] CallSid=${callSid} lead=${lead.lead_name || 'unknown'} property=${lead.property_address || 'unknown'}`);
+  console.log(`[/voice] CallSid=${callSid} routing to Grok Voice (lead=${lead.lead_name || 'unknown'} property=${lead.property_address || 'unknown'} — personalization not passed to Sara in this mode)`);
 
   res.type('text/xml');
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
