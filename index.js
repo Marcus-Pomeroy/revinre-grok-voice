@@ -204,34 +204,10 @@ app.post('/transfer', async (req, res) => {
     });
     console.log(`Lead ${callSid} redirected to conference ${conferenceName} via ${leadTwimlUrl}`);
 
-    // Step 2: Dial all agents simultaneously — each dial creates a new call whose TwiML puts them in the same conference
-    const agentDialPromises = agents.map(async (agent) => {
-      try {
-        const agentTwimlUrl = `${process.env.PUBLIC_URL}/twiml/agent-join/${encodeURIComponent(conferenceName)}?agent_phone=${encodeURIComponent(agent.phone)}`;
-        const agentCall = await client.calls.create({
-          to: agent.phone,
-          from: process.env.TWILIO_NUMBER,
-          url: agentTwimlUrl,
-          method: 'POST',
-          timeout: DIAL_TIMEOUT_SECONDS,
-          statusCallback: `${process.env.PUBLIC_URL}/agent-status/${encodeURIComponent(conferenceName)}`,
-          statusCallbackMethod: 'POST',
-          statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed']
-        });
-        conferenceMap[conferenceName].agentCallSids.push({ sid: agentCall.sid, phone: agent.phone, name: agent.name });
-        console.log(`Agent dial started: ${agent.name} (${agent.phone}) callSid=${agentCall.sid}`);
-        return { agent, callSid: agentCall.sid };
-      } catch (err) {
-        console.error(`Failed to dial agent ${agent.name} (${agent.phone}): ${err.message}`);
-        return null;
-      }
-    });
-
-    await Promise.allSettled(agentDialPromises);
-
-    // Step 3: Start the fallback timer — if no agent joins in DIAL_TIMEOUT_SECONDS + buffer, play "call you back"
-    // Buffer accounts for Twilio call.create() initiate delay (~1-3s) + human pickup swipe (~1-2s).
-    // Timer is stored on the conference so /conference-events can cancel it when an agent joins.
+    // Step 2: Set the fallback timer FIRST — BEFORE dialing agents.
+    // Rationale: dialing agents is async (calls.create HTTP round-trip). If we set the timer after,
+    // the conference-join event webhook can fire BEFORE the timer exists, meaning /conference-events
+    // can't cancel it. Setting the timer here guarantees the handle is in place before any join event.
     const FALLBACK_BUFFER_SECONDS = 10;
     conferenceMap[conferenceName].timeoutHandle = setTimeout(async () => {
       const conf = conferenceMap[conferenceName];
@@ -261,6 +237,31 @@ app.post('/transfer', async (req, res) => {
         console.log(`Timeout fired but agent ${conf.answeredAgent.name} already joined — no action needed`);
       }
     }, (DIAL_TIMEOUT_SECONDS + FALLBACK_BUFFER_SECONDS) * 1000);
+
+    // Step 3: NOW dial all agents simultaneously.
+    const agentDialPromises = agents.map(async (agent) => {
+      try {
+        const agentTwimlUrl = `${process.env.PUBLIC_URL}/twiml/agent-join/${encodeURIComponent(conferenceName)}?agent_phone=${encodeURIComponent(agent.phone)}`;
+        const agentCall = await client.calls.create({
+          to: agent.phone,
+          from: process.env.TWILIO_NUMBER,
+          url: agentTwimlUrl,
+          method: 'POST',
+          timeout: DIAL_TIMEOUT_SECONDS,
+          statusCallback: `${process.env.PUBLIC_URL}/agent-status/${encodeURIComponent(conferenceName)}`,
+          statusCallbackMethod: 'POST',
+          statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed']
+        });
+        conferenceMap[conferenceName].agentCallSids.push({ sid: agentCall.sid, phone: agent.phone, name: agent.name });
+        console.log(`Agent dial started: ${agent.name} (${agent.phone}) callSid=${agentCall.sid}`);
+        return { agent, callSid: agentCall.sid };
+      } catch (err) {
+        console.error(`Failed to dial agent ${agent.name} (${agent.phone}): ${err.message}`);
+        return null;
+      }
+    });
+
+    await Promise.allSettled(agentDialPromises);
 
     return res.json({
       success: true,
@@ -432,52 +433,18 @@ app.post('/conference-events/:conferenceName', async (req, res) => {
     return;
   }
 
-  // participant-join event — check whether this is an agent (not the lead)
+  // Conference join/leave events are logged for observability, but we no longer
+  // use participant-join to cancel the fallback timer — that's now done in
+  // /agent-status when the agent's call becomes 'in-progress' (before whisper).
+  // This avoids the race where a long whisper (15s TTS) causes the join event
+  // to arrive after the fallback timer has already fired.
+
   if (StatusCallbackEvent === 'participant-join') {
-    // Is this an agent leg? Check against tracked agent call SIDs
     const agentEntry = conf.agentCallSids.find(a => a.sid === CallSid);
-    if (agentEntry && !conf.answeredAgent) {
-      conf.answeredAgent = { sid: CallSid, phone: agentEntry.phone, name: agentEntry.name, joined_at: new Date().toISOString() };
-      console.log(`FIRST AGENT JOINED: ${agentEntry.name} (${agentEntry.phone}) — canceling other agent legs`);
-
-      // Cancel the fallback timer — agent made it in time
-      if (conf.timeoutHandle) {
-        clearTimeout(conf.timeoutHandle);
-        conf.timeoutHandle = null;
-        console.log(`Fallback timer canceled for ${conferenceName}`);
-      }
-
-      // Cancel all other agent legs
-      const otherLegs = conf.agentCallSids.filter(a => a.sid !== CallSid);
-      for (const other of otherLegs) {
-        try {
-          const call = await client.calls(other.sid).fetch();
-          if (call.status === 'queued' || call.status === 'ringing' || call.status === 'initiated') {
-            await client.calls(other.sid).update({ status: 'canceled' });
-            console.log(`Canceled other agent leg: ${other.name} (${other.sid})`);
-          }
-        } catch (e) {
-          // ignore
-        }
-      }
-
-      // Update Lofty + send SMS (post-answer work)
-      const agent = findAgentByPhone(agentEntry.phone);
-      const leadInfo = callLeadMap[conf.parentCallSid] || {};
-      if (agent) {
-        if (callLeadMap[conf.parentCallSid]) {
-          callLeadMap[conf.parentCallSid].answered_by_agent = {
-            name: agent.name,
-            phone: agent.phone,
-            lofty_user_id: agent.lofty_user_id,
-            answered_at: new Date().toISOString()
-          };
-        }
-        await Promise.allSettled([
-          assignLeadInLofty(leadInfo.lofty_lead_id, agent.lofty_user_id, agent.name, agent.lofty_email),
-          sendAgentSms(agent, leadInfo)
-        ]);
-      }
+    if (agentEntry) {
+      console.log(`Agent joined conference (post-whisper): ${agentEntry.name}`);
+    } else if (CallSid === conf.parentCallSid) {
+      console.log(`Lead joined conference (hold music playing)`);
     }
   }
 
@@ -488,12 +455,68 @@ app.post('/conference-events/:conferenceName', async (req, res) => {
   }
 });
 
-// Agent-leg status webhook — logs each agent's call progression
-app.post('/agent-status/:conferenceName', (req, res) => {
+// Agent-leg status webhook — logs each agent's call progression.
+// CRITICAL: When ANY agent's status becomes 'in-progress' (i.e. answered), we cancel the fallback timer.
+// Reason: the whisper (~15s of TTS) plays BEFORE the agent joins the conference. If we waited for
+// conference-join to cancel the timer, a slow whisper + slightly delayed answer could exceed 30s
+// and the timer would fire the "call you back" fallback even though a live human answered.
+// Answering the phone is a definitive signal we have an agent — lock in the transfer at that point.
+app.post('/agent-status/:conferenceName', async (req, res) => {
   res.sendStatus(200);
   const conferenceName = decodeURIComponent(req.params.conferenceName || '');
   const { CallSid, CallStatus } = req.body;
   console.log(`Agent status: conference=${conferenceName} callSid=${CallSid} status=${CallStatus}`);
+
+  if (CallStatus !== 'in-progress') return;
+
+  const conf = conferenceMap[conferenceName];
+  if (!conf) return;
+
+  const agentEntry = conf.agentCallSids.find(a => a.sid === CallSid);
+  if (!agentEntry || conf.answeredAgent) return;
+
+  // Lock in this agent as the answerer.
+  conf.answeredAgent = { sid: CallSid, phone: agentEntry.phone, name: agentEntry.name, answered_at: new Date().toISOString() };
+  console.log(`AGENT ANSWERED (whisper starting): ${agentEntry.name} (${agentEntry.phone}) — canceling fallback timer + other agent legs`);
+
+  // Cancel the fallback timer — human is live on the line.
+  if (conf.timeoutHandle) {
+    clearTimeout(conf.timeoutHandle);
+    conf.timeoutHandle = null;
+    console.log(`Fallback timer canceled for ${conferenceName}`);
+  }
+
+  // Cancel all other agent legs still ringing.
+  const otherLegs = conf.agentCallSids.filter(a => a.sid !== CallSid);
+  for (const other of otherLegs) {
+    try {
+      const call = await client.calls(other.sid).fetch();
+      if (call.status === 'queued' || call.status === 'ringing' || call.status === 'initiated') {
+        await client.calls(other.sid).update({ status: 'canceled' });
+        console.log(`Canceled other agent leg: ${other.name} (${other.sid})`);
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  // Kick off Lofty reassignment + SMS immediately — don't wait for conference join.
+  const agent = findAgentByPhone(agentEntry.phone);
+  const leadInfo = callLeadMap[conf.parentCallSid] || {};
+  if (agent) {
+    if (callLeadMap[conf.parentCallSid]) {
+      callLeadMap[conf.parentCallSid].answered_by_agent = {
+        name: agent.name,
+        phone: agent.phone,
+        lofty_user_id: agent.lofty_user_id,
+        answered_at: new Date().toISOString()
+      };
+    }
+    await Promise.allSettled([
+      assignLeadInLofty(leadInfo.lofty_lead_id, agent.lofty_user_id, agent.name, agent.lofty_email),
+      sendAgentSms(agent, leadInfo)
+    ]);
+  }
 });
 
 // Assign the Lofty lead to the specific agent that answered the transfer.
