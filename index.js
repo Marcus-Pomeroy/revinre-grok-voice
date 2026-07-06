@@ -10,6 +10,9 @@ const client = twilio(process.env.TWILIO_SID, process.env.TWILIO_TOKEN);
 // In-memory notepad: call_sid -> lead info
 const callLeadMap = {};
 
+// Conference tracking: conferenceName -> { parentCallSid, agentCallSids: [], answeredAgent: null, timeoutHandle: null }
+const conferenceMap = {};
+
 // Agent roster: which agents to fan out to per destination.
 // Adding/removing agents = edit this map. Numbers must be E.164 format.
 // lofty_user_id must match the userId Lofty API expects for lead assignment.
@@ -24,8 +27,8 @@ const AGENT_ROSTER = {
   ]
 };
 
-// Ring timeout for the fanout (seconds). If nobody picks up, Sara's fallback plays.
-const DIAL_TIMEOUT_SECONDS = 25;
+// Ring timeout for the fanout (seconds). If nobody picks up, we redirect the lead to a "call you back" message.
+const DIAL_TIMEOUT_SECONDS = 20;
 
 // Lookup helper: find agent info from the phone number that Twilio reports as answered
 function findAgentByPhone(phone) {
@@ -39,23 +42,12 @@ function findAgentByPhone(phone) {
 }
 
 // Bridge to Grok Voice via xAI's SIP endpoint.
-// NOTE ON LEAD VARIABLES:
-// xAI's SIP endpoint does NOT read query params or SIP headers for variables.
-// Grok Voice variables are injected via the WebSocket 'session.update'
-// event's 'instructions' field at call time — which requires xAI's
-// webhook → WebSocket flow (POST /v2/phone-numbers with byo_trunk),
-// NOT a Twilio <Dial><Sip> bridge.
-// For now we route Twilio → xAI SIP cleanly; personalization is handled
-// inside Sara's script via her tone/questions rather than dynamic variables.
 app.post('/voice', (req, res) => {
   const callSid = req.body.CallSid;
   const lead = (callSid && callLeadMap[callSid]) || {};
-
-  // Use base SIP URI as-is. Do NOT append query params — xAI's SIP
-  // trunk rejects unknown headers and Twilio plays "application error."
   const sipUri = process.env.XAI_SIP_URI || '';
 
-  console.log(`[/voice] CallSid=${callSid} routing to Grok Voice (lead=${lead.lead_name || 'unknown'} property=${lead.property_address || 'unknown'} — personalization not passed to Sara in this mode)`);
+  console.log(`[/voice] CallSid=${callSid} routing to Grok Voice (lead=${lead.lead_name || 'unknown'} property=${lead.property_address || 'unknown'})`);
 
   res.type('text/xml');
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
@@ -66,22 +58,15 @@ app.post('/voice', (req, res) => {
 </Response>`);
 });
 
-// Normalize lead_name → first name only.
-// Zapier may pass "Marcus Pomeroy" or "Marcus P." — Sara should only speak "Marcus".
+// Normalize helpers
 function firstNameOnly(fullName) {
   if (!fullName || typeof fullName !== 'string') return "unknown";
   const cleaned = fullName.trim();
   if (!cleaned || cleaned.toLowerCase() === 'unknown') return "unknown";
-  // Split on whitespace, take first token. Strip trailing punctuation.
   const first = cleaned.split(/\s+/)[0].replace(/[^\p{L}\p{M}'\-]/gu, '');
   return first || "unknown";
 }
 
-// Normalize property_address → street only.
-// Realtor.com/Lofty typically sends "9145 W Buckskin Trl, Peoria, AZ 85383".
-// Sara should only speak the street portion ("9145 W Buckskin Trl").
-// Strategy: split on comma, take the first segment. If there's no comma,
-// return the whole string (already street-only).
 function streetOnly(addr) {
   if (!addr || typeof addr !== 'string') return "unknown";
   const cleaned = addr.trim();
@@ -90,7 +75,18 @@ function streetOnly(addr) {
   return street || "unknown";
 }
 
-// Start outbound call from Zapier (pass lead info)
+// XML escape for safe injection into TwiML
+function xmlEscape(s) {
+  if (s === null || s === undefined) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+// Start outbound call from Zapier
 app.post('/call', async (req, res) => {
   try {
     const { to, lofty_lead_id, lead_name, lead_email, property_address } = req.body;
@@ -111,10 +107,10 @@ app.post('/call', async (req, res) => {
     callLeadMap[call.sid] = {
       lofty_lead_id: lofty_lead_id || "unknown",
       lead_name: normalizedName,
-      lead_name_full: lead_name || "unknown",   // preserve original for SMS/whisper
+      lead_name_full: lead_name || "unknown",
       lead_email: lead_email || "unknown",
       property_address: normalizedAddress,
-      property_address_full: property_address || "unknown", // preserve original for SMS/whisper
+      property_address_full: property_address || "unknown",
       lead_phone: to,
       created_at: new Date().toISOString(),
       status: "initiated"
@@ -135,17 +131,26 @@ app.post('/call', async (req, res) => {
 });
 
 // ============================================================
-// TRANSFER FLOW (Twilio-driven, replaces Grok's native transfer)
+// TRANSFER FLOW — Conference-based with hold music + simultaneous fanout
 // ============================================================
 
-// Grok Voice's transfer_call tool hits this endpoint.
-// Body: { destination: "revinre" | "hunt" }
-// We find the active call, then Twilio Call Update swaps in new TwiML.
+// Sara's transfer_call tool hits this endpoint.
+// Body: { destination, beds, baths, timeline, pre_approval, area, must_haves }
 app.post('/transfer', async (req, res) => {
   try {
     const destination = (req.body.destination || '').toLowerCase().trim();
 
-    // Validate destination against the agent roster
+    // Capture qualification data — used later in whisper
+    const qualification = {
+      beds: req.body.beds || 'unspecified',
+      baths: req.body.baths || 'unspecified',
+      timeline: req.body.timeline || 'unspecified',
+      pre_approval: req.body.pre_approval || 'unspecified',
+      area: req.body.area || 'unspecified',
+      must_haves: req.body.must_haves || 'none'
+    };
+
+    // Validate destination
     if (!AGENT_ROSTER[destination] || AGENT_ROSTER[destination].length === 0) {
       console.error(`Transfer failed: unknown or empty destination "${destination}"`);
       return res.status(400).json({
@@ -154,8 +159,7 @@ app.post('/transfer', async (req, res) => {
       });
     }
 
-    // Find the currently-active call from our in-memory map.
-    // We look for the most recently-created call still in progress.
+    // Find active call
     const activeCalls = Object.entries(callLeadMap)
       .filter(([_, info]) => info.status === "in-progress" || info.status === "initiated" || info.status === "ringing")
       .sort((a, b) => new Date(b[1].created_at) - new Date(a[1].created_at));
@@ -169,30 +173,96 @@ app.post('/transfer', async (req, res) => {
     }
 
     const [callSid, leadInfo] = activeCalls[0];
-    const agentCount = AGENT_ROSTER[destination].length;
+    const agents = AGENT_ROSTER[destination];
+    const conferenceName = `revinre-lead-${callSid}`;
 
-    console.log(`Transfer requested: call ${callSid} -> ${destination} (fanning out to ${agentCount} agent(s))`);
+    console.log(`Transfer requested: call ${callSid} -> ${destination} conference=${conferenceName} agents=${agents.length}`);
+    console.log(`Qualification data: ${JSON.stringify(qualification)}`);
 
-    // Update the live Twilio call with new TwiML that fans out to agents
-    const twimlUrl = `${process.env.PUBLIC_URL}/twiml/dial/${destination}`;
-
-    await client.calls(callSid).update({
-      url: twimlUrl,
-      method: 'POST'
-    });
-
-    console.log(`Transfer executed: ${callSid} -> ${destination} fanout via ${twimlUrl}`);
-
-    // Mark the transfer intent on the lead record for later Voice Intelligence correlation
+    // Store transfer metadata + qualification for whisper lookup
     callLeadMap[callSid].transfer_destination = destination;
     callLeadMap[callSid].transfer_initiated_at = new Date().toISOString();
+    callLeadMap[callSid].qualification = qualification;
+    callLeadMap[callSid].conference_name = conferenceName;
+
+    // Initialize conference tracking
+    conferenceMap[conferenceName] = {
+      parentCallSid: callSid,
+      destination,
+      qualification,
+      agentCallSids: [],
+      answeredAgent: null,
+      createdAt: new Date().toISOString()
+    };
+
+    // Step 1: Redirect the lead's call into the Conference (with hold music)
+    const leadTwimlUrl = `${process.env.PUBLIC_URL}/twiml/lead-hold/${encodeURIComponent(conferenceName)}`;
+    await client.calls(callSid).update({
+      url: leadTwimlUrl,
+      method: 'POST'
+    });
+    console.log(`Lead ${callSid} redirected to conference ${conferenceName} via ${leadTwimlUrl}`);
+
+    // Step 2: Dial all agents simultaneously — each dial creates a new call whose TwiML puts them in the same conference
+    const agentDialPromises = agents.map(async (agent) => {
+      try {
+        const agentTwimlUrl = `${process.env.PUBLIC_URL}/twiml/agent-join/${encodeURIComponent(conferenceName)}?agent_phone=${encodeURIComponent(agent.phone)}`;
+        const agentCall = await client.calls.create({
+          to: agent.phone,
+          from: process.env.TWILIO_NUMBER,
+          url: agentTwimlUrl,
+          method: 'POST',
+          timeout: DIAL_TIMEOUT_SECONDS,
+          statusCallback: `${process.env.PUBLIC_URL}/agent-status/${encodeURIComponent(conferenceName)}`,
+          statusCallbackMethod: 'POST',
+          statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed']
+        });
+        conferenceMap[conferenceName].agentCallSids.push({ sid: agentCall.sid, phone: agent.phone, name: agent.name });
+        console.log(`Agent dial started: ${agent.name} (${agent.phone}) callSid=${agentCall.sid}`);
+        return { agent, callSid: agentCall.sid };
+      } catch (err) {
+        console.error(`Failed to dial agent ${agent.name} (${agent.phone}): ${err.message}`);
+        return null;
+      }
+    });
+
+    await Promise.allSettled(agentDialPromises);
+
+    // Step 3: Start the fallback timer — if no agent joins in DIAL_TIMEOUT_SECONDS + 5, play "call you back"
+    setTimeout(async () => {
+      const conf = conferenceMap[conferenceName];
+      if (conf && !conf.answeredAgent) {
+        console.log(`Timeout: no agent joined conference ${conferenceName} — playing fallback to lead`);
+        try {
+          await client.calls(callSid).update({
+            url: `${process.env.PUBLIC_URL}/twiml/no-agent-available`,
+            method: 'POST'
+          });
+        } catch (err) {
+          console.error(`Failed to redirect lead to fallback: ${err.message}`);
+        }
+        // Cancel all outstanding agent legs
+        for (const a of conf.agentCallSids) {
+          try {
+            const call = await client.calls(a.sid).fetch();
+            if (call.status === 'queued' || call.status === 'ringing' || call.status === 'initiated') {
+              await client.calls(a.sid).update({ status: 'canceled' });
+              console.log(`Canceled unanswered agent leg: ${a.name} (${a.sid})`);
+            }
+          } catch (e) {
+            // ignore
+          }
+        }
+      }
+    }, (DIAL_TIMEOUT_SECONDS + 5) * 1000);
 
     return res.json({
       success: true,
       call_sid: callSid,
       destination,
-      agent_count: agentCount,
-      message: `Transferring to ${destination} (fanning out to ${agentCount} agent(s))`
+      conference: conferenceName,
+      agent_count: agents.length,
+      message: `Lead moved to conference. Dialing ${agents.length} agent(s) simultaneously.`
     });
   } catch (error) {
     console.error("Transfer error:", error.message);
@@ -200,108 +270,220 @@ app.post('/transfer', async (req, res) => {
   }
 });
 
-// TwiML endpoint that Twilio hits after Call Update.
-// Dials each agent in the roster in parallel, with whisper attached to each Number.
-// Whoever picks up first hears the whisper on their leg; lead hears ringing (no dead air).
-app.post('/twiml/dial/:destination', (req, res) => {
-  const destination = (req.params.destination || '').toLowerCase().trim();
-  const agents = AGENT_ROSTER[destination];
+// TwiML: lead joins the conference with hold music
+app.post('/twiml/lead-hold/:conferenceName', (req, res) => {
+  const conferenceName = decodeURIComponent(req.params.conferenceName || '');
+  const waitUrl = `${process.env.PUBLIC_URL}/hold-music`;
+  const statusCallbackUrl = `${process.env.PUBLIC_URL}/conference-events/${encodeURIComponent(conferenceName)}`;
 
   res.type('text/xml');
-
-  if (!agents || agents.length === 0) {
-    console.error(`No agents configured for destination "${destination}"`);
-    res.send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="alice">I'm sorry, we couldn't complete the transfer. You can reach our team directly at six oh two, five six two, seven two two two. Have a great day.</Say>
-  <Hangup/>
-</Response>`);
-    return;
-  }
-
-  const whisperUrl = `${process.env.PUBLIC_URL}/twiml/whisper/${destination}`;
-  const actionUrl = `${process.env.PUBLIC_URL}/dial-completed/${destination}`;
-
-  // Build one <Number> element per agent with whisper attached
-  const numberElements = agents
-    .map(a => `    <Number url="${whisperUrl}">${a.phone}</Number>`)
-    .join('\n');
-
-  // Short hold message so the lead doesn't hear dead air while we dial the agent.
-  // Twilio's <Dial> after an already-answered call produces silence until bridge —
-  // this <Say> covers that gap. Kept short so it doesn't hold up the transfer.
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice">One moment, connecting you now.</Say>
-  <Dial answerOnBridge="true" callerId="${process.env.TWILIO_NUMBER}" timeout="${DIAL_TIMEOUT_SECONDS}" action="${actionUrl}" method="POST">
-${numberElements}
+  <Dial answerOnBridge="true">
+    <Conference
+      startConferenceOnEnter="false"
+      endConferenceOnExit="true"
+      waitUrl="${xmlEscape(waitUrl)}"
+      waitMethod="POST"
+      statusCallback="${xmlEscape(statusCallbackUrl)}"
+      statusCallbackMethod="POST"
+      statusCallbackEvent="start end join leave">${xmlEscape(conferenceName)}</Conference>
   </Dial>
 </Response>`);
 });
 
-// Called by Twilio when the <Dial> ends (successful bridge, no-answer, busy, etc.).
-// If completed, identify which agent answered and (a) update Lofty (b) SMS the agent.
-app.post('/dial-completed/:destination', async (req, res) => {
-  const destination = (req.params.destination || '').toLowerCase().trim();
-  const { DialCallStatus, DialCallSid, DialCallDuration, CallSid: parentCallSid } = req.body;
+// TwiML: agent joins the conference AFTER hearing the whisper
+app.post('/twiml/agent-join/:conferenceName', (req, res) => {
+  const conferenceName = decodeURIComponent(req.params.conferenceName || '');
+  const agentPhone = req.query.agent_phone || 'unknown';
+  const whisperUrl = `${process.env.PUBLIC_URL}/twiml/whisper/${encodeURIComponent(conferenceName)}`;
+  const statusCallbackUrl = `${process.env.PUBLIC_URL}/conference-events/${encodeURIComponent(conferenceName)}`;
 
-  console.log(`Dial completed: destination=${destination} status=${DialCallStatus} childSid=${DialCallSid} parentSid=${parentCallSid} duration=${DialCallDuration}`);
+  console.log(`Agent TwiML requested: conference=${conferenceName} phone=${agentPhone}`);
 
-  // Always respond immediately — continue whatever's left in the parent TwiML flow.
-  // Empty <Response> just lets the parent call end naturally.
+  // Agent hears whisper via <Play> of whisper TwiML? No — whisper is <Say>, so we need
+  // to inline it. But we don't want to duplicate the whisper text-building logic here.
+  // Solution: use <Redirect> pattern OR play whisper directly then <Dial><Conference>.
+  // Twilio's Conference supports a `whisperUrl` — but that's only for <Number> dials.
+  // For Conference join, the standard pattern is: <Say>whisper</Say><Dial><Conference/></Dial>
+  // We'll fetch the whisper text via a helper and inline it here.
+
+  const whisperText = buildWhisperText(conferenceName);
+
   res.type('text/xml');
-  res.send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">${xmlEscape(whisperText)}</Say>
+  <Dial answerOnBridge="true">
+    <Conference
+      startConferenceOnEnter="true"
+      endConferenceOnExit="true"
+      beep="false"
+      statusCallback="${xmlEscape(statusCallbackUrl)}"
+      statusCallbackMethod="POST"
+      statusCallbackEvent="join leave">${xmlEscape(conferenceName)}</Conference>
+  </Dial>
+</Response>`);
+});
 
-  // Only process successful bridges
-  if (DialCallStatus !== 'completed' && DialCallStatus !== 'answered') {
-    console.log(`Dial ended without connection (${DialCallStatus}) — skipping Lofty/SMS updates`);
+// Build the rich whisper text from stored qualification data
+function buildWhisperText(conferenceName) {
+  const conf = conferenceMap[conferenceName];
+  const teamName = conf?.destination === 'hunt' ? 'Hunt Mortgage' : 'Revinree';
+
+  if (!conf) {
+    return `Incoming ${teamName} lead from Realtor.com. Full details in Lofty. Connecting now.`;
+  }
+
+  const info = callLeadMap[conf.parentCallSid] || {};
+  const q = conf.qualification || {};
+
+  const leadName = (info.lead_name_full && info.lead_name_full !== 'unknown')
+    ? info.lead_name_full
+    : (info.lead_name && info.lead_name !== 'unknown' ? info.lead_name : null);
+  const propertyAddress = (info.property_address_full && info.property_address_full !== 'unknown')
+    ? info.property_address_full
+    : (info.property_address && info.property_address !== 'unknown' ? info.property_address : null);
+
+  const parts = [`Incoming ${teamName} lead from Realtor.com.`];
+  if (leadName) parts.push(`Name: ${leadName}.`);
+  if (propertyAddress) parts.push(`Property: ${propertyAddress}.`);
+
+  // Rich qualification fields — in the priority order the user specified
+  if (q.beds && q.beds !== 'unspecified' && q.baths && q.baths !== 'unspecified') {
+    parts.push(`Looking for ${q.beds} bed, ${q.baths} bath.`);
+  } else if (q.beds && q.beds !== 'unspecified') {
+    parts.push(`Looking for ${q.beds} bedrooms.`);
+  } else if (q.baths && q.baths !== 'unspecified') {
+    parts.push(`Looking for ${q.baths} bathrooms.`);
+  }
+  if (q.timeline && q.timeline !== 'unspecified') {
+    parts.push(`Timeline: ${q.timeline}.`);
+  }
+  if (q.pre_approval && q.pre_approval !== 'unspecified') {
+    parts.push(`Financing: ${q.pre_approval === 'yes' ? 'pre-approved' : q.pre_approval === 'no' ? 'not pre-approved' : q.pre_approval}.`);
+  }
+  if (q.area && q.area !== 'unspecified') {
+    parts.push(`Area: ${q.area}.`);
+  }
+  if (q.must_haves && q.must_haves !== 'none' && q.must_haves !== 'unspecified') {
+    parts.push(`Must-haves: ${q.must_haves}.`);
+  }
+  parts.push(`Connecting now.`);
+  return parts.join(' ');
+}
+
+// Legacy whisper endpoint — kept for backward compat but not used in Conference flow
+app.post('/twiml/whisper/:conferenceName', (req, res) => {
+  const conferenceName = decodeURIComponent(req.params.conferenceName || '');
+  const whisperText = buildWhisperText(conferenceName);
+  console.log(`Whisper (legacy endpoint) for ${conferenceName}: ${whisperText}`);
+  res.type('text/xml');
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">${xmlEscape(whisperText)}</Say>
+</Response>`);
+});
+
+// Hold music TwiML — soft-rock playlist loop from Twilio's public S3 bucket
+// (Royalty-free, Creative Commons). Loops continuously; agent's arrival ends it.
+app.post('/hold-music', (req, res) => {
+  res.type('text/xml');
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play loop="0">http://com.twilio.music.soft-rock.s3.amazonaws.com/_ghost_-_promo_2_sample_pack.mp3</Play>
+</Response>`);
+});
+// Also accept GET (Twilio sometimes fetches waitUrl via GET)
+app.get('/hold-music', (req, res) => {
+  res.type('text/xml');
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play loop="0">http://com.twilio.music.soft-rock.s3.amazonaws.com/_ghost_-_promo_2_sample_pack.mp3</Play>
+</Response>`);
+});
+
+// Fallback TwiML when no agent picks up
+app.post('/twiml/no-agent-available', (req, res) => {
+  res.type('text/xml');
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">Thanks for holding. All of our agents are currently unavailable. Someone from REVINRE will call you back shortly. Have a great day.</Say>
+  <Hangup/>
+</Response>`);
+});
+
+// Conference event webhook — fires on start/end/join/leave
+app.post('/conference-events/:conferenceName', async (req, res) => {
+  res.sendStatus(200);
+  const conferenceName = decodeURIComponent(req.params.conferenceName || '');
+  const { StatusCallbackEvent, ConferenceSid, CallSid, ParticipantLabel, StartConferenceOnEnter } = req.body;
+  console.log(`Conference event: ${conferenceName} event=${StatusCallbackEvent} callSid=${CallSid} confSid=${ConferenceSid}`);
+
+  const conf = conferenceMap[conferenceName];
+  if (!conf) {
+    console.warn(`No conferenceMap entry for ${conferenceName}`);
     return;
   }
 
-  if (!DialCallSid) {
-    console.log(`No DialCallSid — cannot identify answering agent`);
-    return;
+  // participant-join event — check whether this is an agent (not the lead)
+  if (StatusCallbackEvent === 'participant-join') {
+    // Is this an agent leg? Check against tracked agent call SIDs
+    const agentEntry = conf.agentCallSids.find(a => a.sid === CallSid);
+    if (agentEntry && !conf.answeredAgent) {
+      conf.answeredAgent = { sid: CallSid, phone: agentEntry.phone, name: agentEntry.name, joined_at: new Date().toISOString() };
+      console.log(`FIRST AGENT JOINED: ${agentEntry.name} (${agentEntry.phone}) — canceling other agent legs`);
+
+      // Cancel all other agent legs
+      const otherLegs = conf.agentCallSids.filter(a => a.sid !== CallSid);
+      for (const other of otherLegs) {
+        try {
+          const call = await client.calls(other.sid).fetch();
+          if (call.status === 'queued' || call.status === 'ringing' || call.status === 'initiated') {
+            await client.calls(other.sid).update({ status: 'canceled' });
+            console.log(`Canceled other agent leg: ${other.name} (${other.sid})`);
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+
+      // Update Lofty + send SMS (post-answer work)
+      const agent = findAgentByPhone(agentEntry.phone);
+      const leadInfo = callLeadMap[conf.parentCallSid] || {};
+      if (agent) {
+        if (callLeadMap[conf.parentCallSid]) {
+          callLeadMap[conf.parentCallSid].answered_by_agent = {
+            name: agent.name,
+            phone: agent.phone,
+            lofty_user_id: agent.lofty_user_id,
+            answered_at: new Date().toISOString()
+          };
+        }
+        await Promise.allSettled([
+          assignLeadInLofty(leadInfo.lofty_lead_id, agent.lofty_user_id, agent.name, agent.lofty_email),
+          sendAgentSms(agent, leadInfo)
+        ]);
+      }
+    }
   }
 
-  // Post-response async work: identify agent, update Lofty, send SMS
-  try {
-    const childCall = await client.calls(DialCallSid).fetch();
-    const answeredNumber = childCall.to;
-    console.log(`Answering leg to: ${answeredNumber}`);
-
-    const agent = findAgentByPhone(answeredNumber);
-    if (!agent) {
-      console.warn(`No agent match for answered number ${answeredNumber}`);
-      return;
-    }
-
-    // Find lead info from callLeadMap using the parent call SID
-    const leadInfo = callLeadMap[parentCallSid] || {};
-
-    // Record who answered
-    if (callLeadMap[parentCallSid]) {
-      callLeadMap[parentCallSid].answered_by_agent = {
-        name: agent.name,
-        phone: agent.phone,
-        lofty_user_id: agent.lofty_user_id,
-        answered_at: new Date().toISOString()
-      };
-    }
-
-    // Kick off Lofty reassignment + SMS in parallel
-    await Promise.allSettled([
-      assignLeadInLofty(leadInfo.lofty_lead_id, agent.lofty_user_id, agent.name, agent.lofty_email),
-      sendAgentSms(agent, leadInfo)
-    ]);
-  } catch (err) {
-    console.error(`dial-completed post-processing error: ${err.message}`);
+  if (StatusCallbackEvent === 'conference-end') {
+    console.log(`Conference ended: ${conferenceName}`);
+    // Cleanup in-memory tracking after a short delay to allow any final events
+    setTimeout(() => { delete conferenceMap[conferenceName]; }, 60000);
   }
 });
 
+// Agent-leg status webhook — logs each agent's call progression
+app.post('/agent-status/:conferenceName', (req, res) => {
+  res.sendStatus(200);
+  const conferenceName = decodeURIComponent(req.params.conferenceName || '');
+  const { CallSid, CallStatus } = req.body;
+  console.log(`Agent status: conference=${conferenceName} callSid=${CallSid} status=${CallStatus}`);
+});
+
 // Assign the Lofty lead to the specific agent that answered the transfer.
-// Lofty API is inconsistent between OpenAPI schema (array root, role+assignee)
-// and their guide (object root with `assignees`). We try the array form first
-// per the OpenAPI schema, then fall back to the guide form if that 400s.
 async function assignLeadInLofty(loftyLeadId, loftyUserId, agentName, agentEmail) {
   if (!loftyLeadId || loftyLeadId === 'unknown') {
     console.warn(`assignLeadInLofty: missing loftyLeadId — skipping`);
@@ -318,14 +500,9 @@ async function assignLeadInLofty(loftyLeadId, loftyUserId, agentName, agentEmail
     'Authorization': `token ${process.env.LOFTY_API_KEY}`
   };
 
-  // Prefer email if provided (matches OpenAPI example); otherwise stringify user ID
   const assigneeValue = agentEmail || String(loftyUserId);
-
-  // Attempt 1: OpenAPI schema — array root with role + assignee
   const bodyA = [{ role: 'Agent', assignee: assigneeValue }];
-  // Attempt 2: Guide format — object with `assignees` array and numeric userId
   const bodyB = { assignees: [{ userId: loftyUserId }] };
-  // Attempt 3: Same as B but userId as string (JS number precision safety)
   const bodyC = { assignees: [{ userId: String(loftyUserId) }] };
 
   const attempts = [
@@ -347,7 +524,6 @@ async function assignLeadInLofty(loftyLeadId, loftyUserId, agentName, agentEmail
         return;
       }
       console.warn(`Lofty assignment attempt [${attempt.label}] failed: HTTP ${resp.status} body=${text}`);
-      // Only retry on 400 — other errors (401/403/404) won't be fixed by a different body shape
       if (resp.status !== 400) {
         console.error(`Lofty assignment giving up on non-400 status ${resp.status}`);
         return;
@@ -363,7 +539,6 @@ async function assignLeadInLofty(loftyLeadId, loftyUserId, agentName, agentEmail
 async function sendAgentSms(agent, leadInfo) {
   if (!agent.phone) return;
 
-  // SMS to human agent — use FULL name and FULL address (city/state/zip)
   const smsName = (leadInfo.lead_name_full && leadInfo.lead_name_full !== 'unknown')
     ? leadInfo.lead_name_full
     : leadInfo.lead_name;
@@ -391,47 +566,6 @@ async function sendAgentSms(agent, leadInfo) {
     console.error(`Agent SMS error: ${err.message}`);
   }
 }
-
-// Whisper TwiML — played ONLY to the answering agent before the bridge.
-// Lead continues to hear ringing (thanks to answerOnBridge=true on the parent Dial).
-app.post('/twiml/whisper/:destination', (req, res) => {
-  const destination = (req.params.destination || '').toLowerCase().trim();
-
-  // Find the most recently transferred call for context
-  const recentTransfer = Object.entries(callLeadMap)
-    .filter(([_, info]) => info.transfer_destination === destination && info.transfer_initiated_at)
-    .sort((a, b) => new Date(b[1].transfer_initiated_at) - new Date(a[1].transfer_initiated_at))[0];
-
-  let whisperText;
-  const teamName = destination === 'hunt' ? 'Hunt Mortgage' : 'Revinree';
-
-  if (recentTransfer) {
-    const info = recentTransfer[1];
-    // Whisper to human agent — use FULL name and FULL address for context
-    const leadName = (info.lead_name_full && info.lead_name_full !== 'unknown')
-      ? info.lead_name_full
-      : (info.lead_name && info.lead_name !== 'unknown' ? info.lead_name : null);
-    const propertyAddress = (info.property_address_full && info.property_address_full !== 'unknown')
-      ? info.property_address_full
-      : (info.property_address && info.property_address !== 'unknown' ? info.property_address : null);
-
-    const parts = [`Incoming ${teamName} lead from Realtor.com.`];
-    if (leadName) parts.push(`Lead name: ${leadName}.`);
-    if (propertyAddress) parts.push(`Property: ${propertyAddress}.`);
-    parts.push(`Full details in Lofty.`);
-    whisperText = parts.join(' ');
-  } else {
-    whisperText = `Incoming ${teamName} lead from Realtor.com. Full details in Lofty.`;
-  }
-
-  console.log(`Whisper playing for ${destination}: ${whisperText}`);
-
-  res.type('text/xml');
-  res.send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="alice">${whisperText}</Say>
-</Response>`);
-});
 
 // ============================================================
 // VOICE INTELLIGENCE / LOFTY UPDATE PIPELINE (unchanged)
@@ -513,7 +647,6 @@ function deriveOutcome(twilioStatus, operators, leadInfo) {
     return "left_voicemail";
   }
 
-  // If Railway actually executed a transfer, trust that outcome over operator matches
   if (leadInfo && leadInfo.transfer_destination) {
     if (leadInfo.transfer_destination === "hunt") return "Transferred_To_HUNT_Mortgage";
     if (leadInfo.transfer_destination === "revinre") return "Transferred_To_REVINRE";
@@ -593,6 +726,8 @@ app.get('/call/:callSid', async (req, res) => {
       transfer_destination: leadInfo.transfer_destination || null,
       transfer_target: leadInfo.transfer_target || null,
       transfer_initiated_at: leadInfo.transfer_initiated_at || null,
+      qualification: leadInfo.qualification || null,
+      answered_by_agent: leadInfo.answered_by_agent || null,
       created_at: leadInfo.created_at,
       fetched_at: new Date().toISOString()
     };
@@ -612,7 +747,7 @@ app.get('/calls', (req, res) => {
   res.json({ count: calls.length, calls });
 });
 
-// Status callback from Twilio — keeps callLeadMap.status current so /transfer can find active calls
+// Status callback from Twilio
 app.post('/status', (req, res) => {
   const { CallSid, CallStatus } = req.body;
   console.log("Call status update:", CallSid, CallStatus);
