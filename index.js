@@ -941,7 +941,7 @@ async function postSaraWebhookWithRetry(payload) {
       });
       clearTimeout(timeoutId);
       if (resp.ok) {
-        console.log(`[sara-log] webhook OK (attempt ${attempt + 1}) call_sid=${payload.twilio.call_sid} outcome=${payload.outcome_code}`);
+        console.log(`[sara-log] webhook OK (attempt ${attempt + 1}) call_sid=${payload.twilio_call_sid} outcome=${payload.outcome_code}`);
         return true;
       }
       console.warn(`[sara-log] webhook attempt ${attempt + 1} failed: HTTP ${resp.status}`);
@@ -952,7 +952,7 @@ async function postSaraWebhookWithRetry(payload) {
       await new Promise(r => setTimeout(r, delays[attempt]));
     }
   }
-  console.error(`[sara-log] webhook FAILED after ${SARA_LOG_MAX_RETRIES} attempts for call_sid=${payload.twilio.call_sid}`);
+  console.error(`[sara-log] webhook FAILED after ${SARA_LOG_MAX_RETRIES} attempts for call_sid=${payload.twilio_call_sid}`);
   return false;
 }
 
