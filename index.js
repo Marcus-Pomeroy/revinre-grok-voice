@@ -1037,54 +1037,54 @@ async function logSaraCall(callSid, twilioCallStatus) {
     // Event time in America/Phoenix (no DST — always -07:00).
     // Prefer Twilio's endTime; fall back to now if unavailable.
     const endTime = (twilioCall && twilioCall.endTime) || new Date();
-    const eventTimePhx = new Date(endTime).toISOString().replace(/Z$/, '-07:00');
+    const eventTime = new Date(endTime).toISOString().replace(/Z$/, '-07:00');
 
     // Direction: outbound is our /call-initiated flow; inbound would need a
     // separate inbound handler — flag it here so the spreadsheet is honest.
     const direction = twilioCall && twilioCall.direction === 'inbound' ? 'inbound' : 'outbound';
 
-    // Build the payload matching Zap 3A's expected shape.
-    // Nested lead/qualification/twilio objects are flattened by Zapier's field
-    // picker into lead__phone, qualification__beds, twilio__call_sid, etc.
+    // Split lead_name_full into first + last (best-effort)
+    const nameFull = (leadInfo.lead_name_full && leadInfo.lead_name_full !== 'unknown') ? leadInfo.lead_name_full : null;
+    const nameParts = nameFull ? nameFull.split(/\s+/) : [];
+    const leadFirstName = nameParts.length > 0
+      ? nameParts[0]
+      : (leadInfo.lead_name && leadInfo.lead_name !== 'unknown' ? leadInfo.lead_name : null);
+    const leadLastName = nameParts.length > 1 ? nameParts.slice(1).join(' ') : null;
+    const propertyAddressFull = leadInfo.property_address_full && leadInfo.property_address_full !== 'unknown'
+      ? leadInfo.property_address_full
+      : (leadInfo.property_address && leadInfo.property_address !== 'unknown' ? leadInfo.property_address : null);
+    const loftyLeadId = leadInfo.lofty_lead_id && leadInfo.lofty_lead_id !== 'unknown' ? leadInfo.lofty_lead_id : null;
+    const leadEmail = leadInfo.lead_email && leadInfo.lead_email !== 'unknown' ? leadInfo.lead_email : null;
+
+    // Build the payload FLAT — one key per workbook column so Zapier's field
+    // picker shows all 23 fields at the top level (no nested paths). Column
+    // order below matches Excel column order A → W.
     const payload = {
-      event_time_phx: eventTimePhx,
-      direction,
-      call_type: callType,
-      sara_version: SARA_VERSION,
-      outcome_code: outcomeCode,
-      lead: {
-        first_name: leadInfo.lead_name_full && leadInfo.lead_name_full !== 'unknown'
-          ? (leadInfo.lead_name_full.split(/\s+/)[0] || null)
-          : (leadInfo.lead_name && leadInfo.lead_name !== 'unknown' ? leadInfo.lead_name : null),
-        last_name: leadInfo.lead_name_full && leadInfo.lead_name_full !== 'unknown' && leadInfo.lead_name_full.split(/\s+/).length > 1
-          ? leadInfo.lead_name_full.split(/\s+/).slice(1).join(' ')
-          : null,
-        phone: leadInfo.lead_phone || null,
-        email: leadInfo.lead_email && leadInfo.lead_email !== 'unknown' ? leadInfo.lead_email : null,
-        property_address: leadInfo.property_address_full && leadInfo.property_address_full !== 'unknown'
-          ? leadInfo.property_address_full
-          : (leadInfo.property_address && leadInfo.property_address !== 'unknown' ? leadInfo.property_address : null),
-        lofty_lead_id: leadInfo.lofty_lead_id && leadInfo.lofty_lead_id !== 'unknown' ? leadInfo.lofty_lead_id : null
-      },
-      qualification: {
-        beds: q.beds && q.beds !== 'unspecified' ? q.beds : null,
-        baths: q.baths && q.baths !== 'unspecified' ? q.baths : null,
-        area_or_zip: q.area && q.area !== 'unspecified' ? q.area : null,
-        must_haves: q.must_haves && q.must_haves !== 'none' && q.must_haves !== 'unspecified' ? q.must_haves : null,
-        timeline: q.timeline && q.timeline !== 'unspecified' ? q.timeline : null,
-        preapproval_status: preapprovalStatus
-      },
-      transfer_destination: transferDestination,
-      answering_agent: answeringAgent,
-      call_duration_sec: callDurationSec,
-      retry_attempt_number: retryAttempt,
-      twilio: {
-        call_sid: callSid
-      }
+      event_time: eventTime,                                                              // A
+      direction: direction,                                                                // B
+      call_type: callType,                                                                 // C
+      sara_version: SARA_VERSION,                                                          // D
+      outcome_code: outcomeCode,                                                           // E
+      lead_first_name: leadFirstName,                                                      // F
+      lead_last_name: leadLastName,                                                        // G
+      lead_phone: leadInfo.lead_phone || null,                                             // H
+      lead_email: leadEmail,                                                               // I
+      property_address: propertyAddressFull,                                               // J
+      lofty_lead_id: loftyLeadId,                                                          // K
+      beds: q.beds && q.beds !== 'unspecified' ? q.beds : null,                            // L
+      baths: q.baths && q.baths !== 'unspecified' ? q.baths : null,                        // M
+      area_or_zip: q.area && q.area !== 'unspecified' ? q.area : null,                     // N
+      must_haves: q.must_haves && q.must_haves !== 'none' && q.must_haves !== 'unspecified' ? q.must_haves : null, // O
+      timeline: q.timeline && q.timeline !== 'unspecified' ? q.timeline : null,            // P
+      preapproval_status: preapprovalStatus,                                               // Q
+      transfer_destination: transferDestination,                                           // R
+      answering_agent: answeringAgent,                                                     // S
+      call_duration_sec: callDurationSec,                                                  // T
+      retry_attempt_number: retryAttempt,                                                  // U
+      twilio_call_sid: callSid                                                             // V
     };
 
-    // Attach a pre-stringified copy of the payload for the audit column (W).
-    // Excel cell cap is 32767; truncate at 32000 to leave headroom.
+    // Column W — pre-stringified audit copy. Excel cell cap 32767; truncate at 32000.
     payload.raw_webhook_payload = JSON.stringify(payload).slice(0, 32000);
 
     // Fire in background — do not block /status response.
