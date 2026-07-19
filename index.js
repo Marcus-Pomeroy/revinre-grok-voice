@@ -41,13 +41,79 @@ function findAgentByPhone(phone) {
   return null;
 }
 
-// Bridge to Grok Voice via xAI's SIP endpoint.
+// ============================================================
+// SARA PRE-CONNECT CONFERENCE FLOW
+// ============================================================
+// To eliminate the "ring then dead air" experience the lead used to hear:
+//   1. /call dials Sara INTO a conference first (she waits silently)
+//   2. /call then dials the lead into the SAME conference
+//   3. When the lead answers, Sara is already there — she speaks first
+//      immediately (per Sara prompt Rule #1)
+//
+// Endpoints below:
+//   /voice/sara-join/:conf   — Sara joins the conference in waiting state
+//   /voice/lead-join/:conf   — Lead joins the conference and starts it live
+//
+// The legacy /voice endpoint remains as a fallback for direct SIP-only
+// bridging (should not be used by the main /call flow going forward).
+// ============================================================
+
+// Sara joins the conference in "waiting" mode. She sits silently until the
+// lead arrives — startConferenceOnEnter=false means audio does not flow yet.
+app.post('/voice/sara-join/:conferenceName', (req, res) => {
+  const conferenceName = decodeURIComponent(req.params.conferenceName || '');
+  const statusCallbackUrl = `${process.env.PUBLIC_URL}/conference-events/${encodeURIComponent(conferenceName)}`;
+
+  console.log(`[/voice/sara-join] conference=${conferenceName}`);
+
+  res.type('text/xml');
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial>
+    <Conference
+      startConferenceOnEnter="false"
+      endConferenceOnExit="true"
+      beep="false"
+      waitUrl=""
+      statusCallback="${xmlEscape(statusCallbackUrl)}"
+      statusCallbackMethod="POST"
+      statusCallbackEvent="start end join leave">${xmlEscape(conferenceName)}</Conference>
+  </Dial>
+</Response>`);
+});
+
+// Lead joins the conference and STARTS it live — the moment they answer,
+// Sara's audio channel opens and she speaks first.
+app.post('/voice/lead-join/:conferenceName', (req, res) => {
+  const conferenceName = decodeURIComponent(req.params.conferenceName || '');
+  const statusCallbackUrl = `${process.env.PUBLIC_URL}/conference-events/${encodeURIComponent(conferenceName)}`;
+
+  console.log(`[/voice/lead-join] conference=${conferenceName}`);
+
+  res.type('text/xml');
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial>
+    <Conference
+      startConferenceOnEnter="true"
+      endConferenceOnExit="true"
+      beep="false"
+      waitUrl=""
+      record="record-from-start"
+      statusCallback="${xmlEscape(statusCallbackUrl)}"
+      statusCallbackMethod="POST"
+      statusCallbackEvent="start end join leave">${xmlEscape(conferenceName)}</Conference>
+  </Dial>
+</Response>`);
+});
+
+// LEGACY: Bridge to Grok Voice via xAI's SIP endpoint (kept for fallback).
 app.post('/voice', (req, res) => {
   const callSid = req.body.CallSid;
   const lead = (callSid && callLeadMap[callSid]) || {};
   const sipUri = process.env.XAI_SIP_URI || '';
 
-  console.log(`[/voice] CallSid=${callSid} routing to Grok Voice (lead=${lead.lead_name || 'unknown'} property=${lead.property_address || 'unknown'})`);
+  console.log(`[/voice LEGACY] CallSid=${callSid} routing to Grok Voice (lead=${lead.lead_name || 'unknown'} property=${lead.property_address || 'unknown'})`);
 
   res.type('text/xml');
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
@@ -99,7 +165,16 @@ function xmlEscape(s) {
     .replace(/'/g, '&apos;');
 }
 
-// Start outbound call from Zapier
+// Start outbound call from Zapier.
+//
+// PRE-CONNECT CONFERENCE FLOW:
+//   1. Generate a unique conferenceName
+//   2. Dial Sara (xAI SIP) into the conference — she waits silently
+//   3. Dial the lead into the same conference — the moment they answer,
+//      Sara is already there and speaks first per prompt Rule #1
+//
+// The lead-leg CallSid is what gets logged to the Sara Call Log (Zap 3A).
+// This preserves the schema: 1 lead call = 1 row.
 app.post('/call', async (req, res) => {
   try {
     const { to, lofty_lead_id, lead_name, lead_email, property_address } = req.body;
@@ -107,8 +182,30 @@ app.post('/call', async (req, res) => {
     const normalizedName = firstNameOnly(lead_name);
     const normalizedAddress = streetOnly(property_address);
 
-    const call = await client.calls.create({
-      url: `${process.env.PUBLIC_URL}/voice`,
+    // Unique conference name for this call session.
+    const conferenceName = `sara-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    const sipUri = process.env.XAI_SIP_URI || '';
+    if (!sipUri) {
+      console.error('XAI_SIP_URI not set — cannot pre-connect Sara');
+      return res.status(500).json({ success: false, error: 'XAI_SIP_URI not configured' });
+    }
+
+    // Step 1 — dial Sara into the conference FIRST (she waits silently).
+    // Sara joins with startConferenceOnEnter=false, so no audio flows yet.
+    const saraCall = await client.calls.create({
+      url: `${process.env.PUBLIC_URL}/voice/sara-join/${encodeURIComponent(conferenceName)}`,
+      to: `sip:${sipUri.replace(/^sip:/, '')}`,
+      from: process.env.TWILIO_NUMBER,
+      method: 'POST'
+    });
+
+    console.log(`[/call] Sara pre-connect: conf=${conferenceName} sara_sid=${saraCall.sid}`);
+
+    // Step 2 — dial the lead into the same conference.
+    // When the lead answers, startConferenceOnEnter=true opens Sara's audio channel.
+    const leadCall = await client.calls.create({
+      url: `${process.env.PUBLIC_URL}/voice/lead-join/${encodeURIComponent(conferenceName)}`,
       to,
       from: process.env.TWILIO_NUMBER,
       method: 'POST',
@@ -117,7 +214,9 @@ app.post('/call', async (req, res) => {
       statusCallbackMethod: 'POST'
     });
 
-    callLeadMap[call.sid] = {
+    // Store lead-leg call metadata under the LEAD CallSid — this is the SID
+    // logged to Zap 3A and used by /transfer for participant lookups.
+    callLeadMap[leadCall.sid] = {
       lofty_lead_id: lofty_lead_id || "unknown",
       lead_name: normalizedName,
       lead_name_full: lead_name || "unknown",
@@ -127,19 +226,24 @@ app.post('/call', async (req, res) => {
       lead_phone: to,
       created_at: new Date().toISOString(),
       status: "initiated",
+      // Pre-connect state — Sara call sid + conference name for the transfer flow.
+      sara_call_sid: saraCall.sid,
+      conference_name: conferenceName,
       // Sara webhook idempotency guard — flipped true after first successful Zap 3A fire
       sara_logged: false,
       // Retry attempt number, incremented by Zapier before each redial (default 1)
       retry_attempt_number: parseInt(req.body.retry_attempt_number, 10) || 1
     };
 
-    console.log(`Call started: ${call.sid} for lead ${lofty_lead_id} (raw="${lead_name}" → sara="${normalizedName}") property: raw="${property_address}" → sara="${normalizedAddress}"`);
+    console.log(`Call started: ${leadCall.sid} for lead ${lofty_lead_id} (raw="${lead_name}" → sara="${normalizedName}") property: raw="${property_address}" → sara="${normalizedAddress}" conf=${conferenceName}`);
 
     res.json({
       success: true,
-      call_sid: call.sid,
+      call_sid: leadCall.sid,
+      sara_call_sid: saraCall.sid,
+      conference_name: conferenceName,
       lofty_lead_id,
-      message: "Call started. Check /call/" + call.sid + " later for full details."
+      message: "Call started. Check /call/" + leadCall.sid + " later for full details."
     });
   } catch (error) {
     console.error("Error starting call:", error.message);
