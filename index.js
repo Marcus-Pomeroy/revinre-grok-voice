@@ -126,7 +126,11 @@ app.post('/call', async (req, res) => {
       property_address_full: property_address || "unknown",
       lead_phone: to,
       created_at: new Date().toISOString(),
-      status: "initiated"
+      status: "initiated",
+      // Sara webhook idempotency guard — flipped true after first successful Zap 3A fire
+      sara_logged: false,
+      // Retry attempt number, incremented by Zapier before each redial (default 1)
+      retry_attempt_number: parseInt(req.body.retry_attempt_number, 10) || 1
     };
 
     console.log(`Call started: ${call.sid} for lead ${lofty_lead_id} (raw="${lead_name}" → sara="${normalizedName}") property: raw="${property_address}" → sara="${normalizedAddress}"`);
@@ -872,6 +876,228 @@ app.get('/calls', (req, res) => {
   res.json({ count: calls.length, calls });
 });
 
+// ============================================================
+// SARA CALL LOG WEBHOOK (Zap 3A)
+// ============================================================
+// One row per call to REVINRE_Sara_Call_Log.xlsx → Call Log Raw.
+// Fires exactly once when Twilio reports a terminal state
+// (completed/no-answer/busy/failed/canceled) via /status below.
+//
+// - Env-guarded: if ZAP_SARA_CALL_LOG_WEBHOOK_URL is unset it no-ops,
+//   so this deploy is safe even before Zap 3A is built in Zapier.
+// - Idempotency: callLeadMap[callSid].sara_logged flag prevents double-fires
+//   from Twilio duplicate status callbacks.
+// - Retry: 3x exponential backoff (1s, 4s, 16s), non-blocking.
+// - Rich payload for completed calls: fetches VI transcript + operators
+//   to derive outcome_code, then flattens qualification + lead + twilio
+//   subfields into the 23-column schema Zap 3A expects.
+// ============================================================
+
+const SARA_TERMINAL_STATUSES = new Set(['completed', 'no-answer', 'busy', 'failed', 'canceled']);
+const SARA_VERSION = process.env.SARA_VERSION || '1.0';
+const SARA_LOG_MAX_RETRIES = 3;
+const SARA_LOG_TIMEOUT_MS = 10000;
+
+// Map Twilio status + VI operators + transfer state to Sara's outcome codes
+// (see zap_3_sara_call_log_spec.md → Outcome Codes for the canonical list).
+function deriveSaraOutcomeCode(twilioStatus, operators, leadInfo) {
+  if (twilioStatus === 'no-answer') return 'no_answer';
+  if (twilioStatus === 'busy') return 'busy';
+  if (twilioStatus === 'failed') return 'failed_tech';
+  if (twilioStatus === 'canceled') return 'canceled';
+
+  // completed — check richer signals
+  const matched = (name) => operators.find(op => op.name === name && op.matched);
+
+  if (matched('Voicemail Detection') || matched('Voicemail Left')) return 'voicemail_left';
+
+  // If the call ended with a successful transfer, log that outcome
+  if (leadInfo && leadInfo.answered_by_agent) return 'transferred_live';
+
+  if (matched('Not Interested')) return 'not_interested';
+  if (matched('Opt Out')) return 'opt_out';
+  if (matched('Callback Requested')) return 'callback_requested';
+  if (matched('Wrong Number')) return 'wrong_number';
+  if (matched('Link Sent Email') || matched('Link Sent')) return 'link_sent_email';
+  if (matched('Booked') || matched('Appointment Booked')) return 'booked';
+
+  // Completed but no strong signal — treat as follow-up
+  return 'follow_up_needed';
+}
+
+// Non-blocking retry loop with exponential backoff (1s, 4s, 16s)
+async function postSaraWebhookWithRetry(payload) {
+  const url = process.env.ZAP_SARA_CALL_LOG_WEBHOOK_URL;
+  const delays = [1000, 4000, 16000];
+  for (let attempt = 0; attempt < SARA_LOG_MAX_RETRIES; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), SARA_LOG_TIMEOUT_MS);
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+      if (resp.ok) {
+        console.log(`[sara-log] webhook OK (attempt ${attempt + 1}) call_sid=${payload.twilio.call_sid} outcome=${payload.outcome_code}`);
+        return true;
+      }
+      console.warn(`[sara-log] webhook attempt ${attempt + 1} failed: HTTP ${resp.status}`);
+    } catch (err) {
+      console.warn(`[sara-log] webhook attempt ${attempt + 1} error: ${err.message}`);
+    }
+    if (attempt < SARA_LOG_MAX_RETRIES - 1) {
+      await new Promise(r => setTimeout(r, delays[attempt]));
+    }
+  }
+  console.error(`[sara-log] webhook FAILED after ${SARA_LOG_MAX_RETRIES} attempts for call_sid=${payload.twilio.call_sid}`);
+  return false;
+}
+
+// Build the 23-field payload for one call and fire the webhook.
+// Fires in background (returns immediately). Called from /status on terminal states.
+async function logSaraCall(callSid, twilioCallStatus) {
+  const webhookUrl = process.env.ZAP_SARA_CALL_LOG_WEBHOOK_URL;
+  if (!webhookUrl) {
+    console.log(`[sara-log] ZAP_SARA_CALL_LOG_WEBHOOK_URL not set — skipping (call_sid=${callSid})`);
+    return;
+  }
+
+  const leadInfo = callLeadMap[callSid];
+  if (!leadInfo) {
+    console.warn(`[sara-log] no callLeadMap entry for ${callSid} — skipping`);
+    return;
+  }
+  if (leadInfo.sara_logged) {
+    console.log(`[sara-log] already logged for ${callSid} — skipping duplicate status callback`);
+    return;
+  }
+
+  // Mark BEFORE the async work so a duplicate callback that arrives during
+  // the VI fetch doesn't race us into a double-fire.
+  leadInfo.sara_logged = true;
+
+  try {
+    // Fetch the Twilio call record for authoritative status/duration/timing.
+    let twilioCall = null;
+    try {
+      twilioCall = await client.calls(callSid).fetch();
+    } catch (e) {
+      console.warn(`[sara-log] Twilio calls.fetch failed for ${callSid}: ${e.message}`);
+    }
+
+    // For completed calls, pull the VI transcript + operators to derive outcome.
+    let operators = [];
+    if (twilioCallStatus === 'completed') {
+      try {
+        const recordings = await client.recordings.list({ callSid, limit: 1 });
+        if (recordings.length > 0) {
+          const vi = await fetchVoiceIntelligenceData(recordings[0].sid);
+          operators = vi.operators || [];
+        }
+      } catch (e) {
+        console.warn(`[sara-log] VI fetch failed for ${callSid}: ${e.message} — using status-only outcome`);
+      }
+    }
+
+    const outcomeCode = deriveSaraOutcomeCode(twilioCallStatus, operators, leadInfo);
+
+    // Compute call_type from retry_attempt_number (matches Jordan pattern)
+    const retryAttempt = leadInfo.retry_attempt_number || 1;
+    const callType = retryAttempt === 1 ? 'new_call' : 'follow_up';
+
+    // Map Railway's internal destination code to the value Sara's spreadsheet expects
+    const transferDestinationMap = {
+      revinre: 'revinre_agent',
+      hunt: 'hunt_mortgage'
+    };
+    const transferDestination = leadInfo.transfer_destination
+      ? (transferDestinationMap[leadInfo.transfer_destination] || leadInfo.transfer_destination)
+      : null;
+
+    const answeringAgent = leadInfo.answered_by_agent
+      ? leadInfo.answered_by_agent.phone
+      : null;
+
+    const q = leadInfo.qualification || {};
+    const preapprovalRaw = q.pre_approval;
+    const preapprovalStatus = preapprovalRaw === 'yes'
+      ? 'preapproved'
+      : preapprovalRaw === 'no'
+        ? 'not_preapproved'
+        : (preapprovalRaw && preapprovalRaw !== 'unspecified' ? preapprovalRaw : null);
+
+    // Duration: prefer Twilio's authoritative record, fall back to what we have
+    const callDurationSec = twilioCall && twilioCall.duration
+      ? parseInt(twilioCall.duration, 10)
+      : 0;
+
+    // Event time in America/Phoenix (no DST — always -07:00).
+    // Prefer Twilio's endTime; fall back to now if unavailable.
+    const endTime = (twilioCall && twilioCall.endTime) || new Date();
+    const eventTimePhx = new Date(endTime).toISOString().replace(/Z$/, '-07:00');
+
+    // Direction: outbound is our /call-initiated flow; inbound would need a
+    // separate inbound handler — flag it here so the spreadsheet is honest.
+    const direction = twilioCall && twilioCall.direction === 'inbound' ? 'inbound' : 'outbound';
+
+    // Build the payload matching Zap 3A's expected shape.
+    // Nested lead/qualification/twilio objects are flattened by Zapier's field
+    // picker into lead__phone, qualification__beds, twilio__call_sid, etc.
+    const payload = {
+      event_time_phx: eventTimePhx,
+      direction,
+      call_type: callType,
+      sara_version: SARA_VERSION,
+      outcome_code: outcomeCode,
+      lead: {
+        first_name: leadInfo.lead_name_full && leadInfo.lead_name_full !== 'unknown'
+          ? (leadInfo.lead_name_full.split(/\s+/)[0] || null)
+          : (leadInfo.lead_name && leadInfo.lead_name !== 'unknown' ? leadInfo.lead_name : null),
+        last_name: leadInfo.lead_name_full && leadInfo.lead_name_full !== 'unknown' && leadInfo.lead_name_full.split(/\s+/).length > 1
+          ? leadInfo.lead_name_full.split(/\s+/).slice(1).join(' ')
+          : null,
+        phone: leadInfo.lead_phone || null,
+        email: leadInfo.lead_email && leadInfo.lead_email !== 'unknown' ? leadInfo.lead_email : null,
+        property_address: leadInfo.property_address_full && leadInfo.property_address_full !== 'unknown'
+          ? leadInfo.property_address_full
+          : (leadInfo.property_address && leadInfo.property_address !== 'unknown' ? leadInfo.property_address : null),
+        lofty_lead_id: leadInfo.lofty_lead_id && leadInfo.lofty_lead_id !== 'unknown' ? leadInfo.lofty_lead_id : null
+      },
+      qualification: {
+        beds: q.beds && q.beds !== 'unspecified' ? q.beds : null,
+        baths: q.baths && q.baths !== 'unspecified' ? q.baths : null,
+        area_or_zip: q.area && q.area !== 'unspecified' ? q.area : null,
+        must_haves: q.must_haves && q.must_haves !== 'none' && q.must_haves !== 'unspecified' ? q.must_haves : null,
+        timeline: q.timeline && q.timeline !== 'unspecified' ? q.timeline : null,
+        preapproval_status: preapprovalStatus
+      },
+      transfer_destination: transferDestination,
+      answering_agent: answeringAgent,
+      call_duration_sec: callDurationSec,
+      retry_attempt_number: retryAttempt,
+      twilio: {
+        call_sid: callSid
+      }
+    };
+
+    // Attach a pre-stringified copy of the payload for the audit column (W).
+    // Excel cell cap is 32767; truncate at 32000 to leave headroom.
+    payload.raw_webhook_payload = JSON.stringify(payload).slice(0, 32000);
+
+    // Fire in background — do not block /status response.
+    postSaraWebhookWithRetry(payload).catch(err => {
+      console.error(`[sara-log] unexpected error posting webhook for ${callSid}: ${err.message}`);
+    });
+  } catch (err) {
+    console.error(`[sara-log] failed to build payload for ${callSid}: ${err.message}`);
+    // Un-flip the guard so a manual retry / next status callback can try again
+    leadInfo.sara_logged = false;
+  }
+}
+
 // Status callback from Twilio
 app.post('/status', (req, res) => {
   const { CallSid, CallStatus } = req.body;
@@ -879,7 +1105,13 @@ app.post('/status', (req, res) => {
   if (callLeadMap[CallSid]) {
     callLeadMap[CallSid].status = CallStatus;
   }
+  // Ack Twilio immediately, then fire Sara webhook in background if terminal.
   res.sendStatus(200);
+  if (SARA_TERMINAL_STATUSES.has(CallStatus)) {
+    logSaraCall(CallSid, CallStatus).catch(err => {
+      console.error(`[sara-log] logSaraCall threw for ${CallSid}: ${err.message}`);
+    });
+  }
 });
 
 app.get('/', (req, res) => {
