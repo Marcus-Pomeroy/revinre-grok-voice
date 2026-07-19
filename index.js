@@ -203,6 +203,53 @@ app.post('/tool/get-lead-info', (req, res) => {
 });
 
 // ============================================================
+// SAVE QUALIFICATION — Sara calls this incrementally during the conversation
+// so we capture beds/baths/timeline/etc. even if the call ends before a
+// transfer fires. Body accepts any subset of qualification fields; missing
+// keys don't overwrite existing values.
+// Body: { beds?, baths?, timeline?, area?, must_haves?, pre_approval? }
+// ============================================================
+app.post('/tool/save-qualification', (req, res) => {
+  try {
+    const activeCalls = Object.entries(callLeadMap)
+      .filter(([_, info]) => info.status === 'in-progress' || info.status === 'initiated' || info.status === 'ringing')
+      .sort((a, b) => new Date(b[1].created_at) - new Date(a[1].created_at));
+
+    if (activeCalls.length === 0) {
+      console.warn('[/tool/save-qualification] no active call found — ignoring');
+      return res.json({ success: true, saved: false, message: 'No active call context.' });
+    }
+
+    const [callSid, info] = activeCalls[0];
+    const existing = info.qualification || {};
+
+    // Merge — only overwrite when the new value is a non-empty string.
+    const incoming = {
+      beds: req.body.beds,
+      baths: req.body.baths,
+      timeline: req.body.timeline,
+      area: req.body.area,
+      must_haves: req.body.must_haves,
+      pre_approval: req.body.pre_approval
+    };
+    const merged = { ...existing };
+    for (const [k, v] of Object.entries(incoming)) {
+      if (v !== undefined && v !== null && String(v).trim() !== '') {
+        merged[k] = String(v).trim();
+      }
+    }
+
+    callLeadMap[callSid].qualification = merged;
+    console.log(`[/tool/save-qualification] callSid=${callSid} merged=${JSON.stringify(merged)}`);
+
+    return res.json({ success: true, saved: true, qualification: merged });
+  } catch (err) {
+    console.error('[/tool/save-qualification] error:', err.message);
+    return res.json({ success: true, saved: false, error: err.message });
+  }
+});
+
+// ============================================================
 // TRANSFER FLOW — Conference-based with hold music + simultaneous fanout
 // ============================================================
 
@@ -212,14 +259,21 @@ app.post('/transfer', async (req, res) => {
   try {
     const destination = (req.body.destination || '').toLowerCase().trim();
 
-    // Capture qualification data — used later in whisper
+    // Capture qualification data — used later in whisper. Merge with any
+    // fields Sara already saved via /tool/save-qualification so we don't
+    // lose data if the transfer call omits a field she previously provided.
+    // Look up the active call BEFORE building qualification so we can merge.
+    const activeCallsForQual = Object.entries(callLeadMap)
+      .filter(([_, info]) => info.status === 'in-progress' || info.status === 'initiated' || info.status === 'ringing')
+      .sort((a, b) => new Date(b[1].created_at) - new Date(a[1].created_at));
+    const priorQual = activeCallsForQual.length > 0 ? (activeCallsForQual[0][1].qualification || {}) : {};
     const qualification = {
-      beds: req.body.beds || 'unspecified',
-      baths: req.body.baths || 'unspecified',
-      timeline: req.body.timeline || 'unspecified',
-      pre_approval: req.body.pre_approval || 'unspecified',
-      area: req.body.area || 'unspecified',
-      must_haves: req.body.must_haves || 'none'
+      beds: req.body.beds || priorQual.beds || 'unspecified',
+      baths: req.body.baths || priorQual.baths || 'unspecified',
+      timeline: req.body.timeline || priorQual.timeline || 'unspecified',
+      pre_approval: req.body.pre_approval || priorQual.pre_approval || 'unspecified',
+      area: req.body.area || priorQual.area || 'unspecified',
+      must_haves: req.body.must_haves || priorQual.must_haves || 'none'
     };
 
     // Validate destination
