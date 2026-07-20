@@ -601,7 +601,15 @@ function buildWhisperText(conferenceName) {
     parts.push(`Timeline: ${q.timeline}.`);
   }
   if (q.pre_approval && q.pre_approval !== 'unspecified') {
-    parts.push(`Financing: ${q.pre_approval === 'yes' ? 'pre-approved' : q.pre_approval === 'no' ? 'not pre-approved' : q.pre_approval}.`);
+    let financingText;
+    switch (q.pre_approval) {
+      case 'yes': financingText = 'pre-approved'; break;
+      case 'no': financingText = 'not pre-approved'; break;
+      case 'in_progress': financingText = 'working on pre-approval'; break;
+      case 'cash': financingText = 'paying cash'; break;
+      default: financingText = q.pre_approval;
+    }
+    parts.push(`Financing: ${financingText}.`);
   }
   if (q.area && q.area !== 'unspecified') {
     parts.push(`Area: ${q.area}.`);
@@ -1192,10 +1200,13 @@ async function logSaraCall(callSid, twilioCallStatus) {
       ? parseInt(twilioCall.duration, 10)
       : 0;
 
-    // Event time in America/Phoenix (no DST — always -07:00).
+    // Event time in America/Phoenix (no DST — always UTC-07:00).
     // Prefer Twilio's endTime; fall back to now if unavailable.
+    // toISOString() returns UTC, so we shift by 7 hours before formatting
+    // and label the result with the -07:00 offset.
     const endTime = (twilioCall && twilioCall.endTime) || new Date();
-    const eventTime = new Date(endTime).toISOString().replace(/Z$/, '-07:00');
+    const phoenixMs = new Date(endTime).getTime() - (7 * 60 * 60 * 1000);
+    const eventTime = new Date(phoenixMs).toISOString().replace(/Z$/, '-07:00');
 
     // Direction: outbound is our /call-initiated flow; inbound would need a
     // separate inbound handler — flag it here so the spreadsheet is honest.
