@@ -1275,11 +1275,21 @@ app.post('/status', (req, res) => {
     callLeadMap[CallSid].status = CallStatus;
   }
   // Ack Twilio immediately, then fire Sara webhook in background if terminal.
+  // 2-minute delay: gives Twilio Voice Intelligence time to finish processing
+  // the transcript + operators before we derive the outcome. The call has
+  // already ended (Twilio only fires terminal /status once), so we only wait
+  // for VI post-processing. Without this delay, VM messages Sara delivered
+  // near call end may not yet appear in the VI transcript when
+  // deriveSaraOutcomeCode runs — causing the workbook to log `follow_up_needed`
+  // while the downstream Zap correctly logs `left_voicemail` in Lofty.
   res.sendStatus(200);
   if (SARA_TERMINAL_STATUSES.has(CallStatus)) {
-    logSaraCall(CallSid, CallStatus).catch(err => {
-      console.error(`[sara-log] logSaraCall threw for ${CallSid}: ${err.message}`);
-    });
+    setTimeout(() => {
+      logSaraCall(CallSid, CallStatus).catch(err => {
+        console.error(`[sara-log] logSaraCall threw for ${CallSid}: ${err.message}`);
+      });
+    }, 2 * 60 * 1000); // 2 minutes
+    console.log(`[sara-log] scheduled workbook log for ${CallSid} in 2min (status=${CallStatus})`);
   }
 });
 
