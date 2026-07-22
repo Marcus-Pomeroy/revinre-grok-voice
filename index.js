@@ -835,7 +835,7 @@ async function sendAgentSms(agent, leadInfo) {
   try {
     const msg = await client.messages.create({
       to: agent.phone,
-      from: process.env.TWILIO_NUMBER,
+      messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
       body: messageBody
     });
     console.log(`Agent SMS sent to ${agent.name} (${agent.phone}): ${msg.sid}`);
